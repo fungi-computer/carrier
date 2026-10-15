@@ -1,0 +1,28 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "extends": "../../tooling/docs/typedoc.base.json",
+  "name": "@fungi.computer/carrier",
+  "entryPoints": [
+    "src/index.ts",
+    "src/email.ts",
+    "src/post.ts",
+    "src/inspection.ts",
+    "src/cloudflare.ts",
+    "src/post-d1.ts",
+    "src/post-postgres.ts",
+    "src/testing.ts"
+  ],
+  "tsconfig": "tsconfig.json",
+  "out": "docs/api",
+  "requiredToBeDocumented": [
+    "Enum",
+    "EnumMember",
+    "Variable",
+    "Function",
+    "Class",
+    "Interface",
+    "Method",
+    "Accessor",
+    "TypeAlias"
+  ]
+}

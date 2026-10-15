@@ -1,0 +1,117 @@
+{
+  "expectedTarballFiles": [
+    "package/LICENSE",
+    "package/README.md",
+    "package/dist/cloudflare.d.ts",
+    "package/dist/cloudflare.js",
+    "package/dist/email.d.ts",
+    "package/dist/email.js",
+    "package/dist/index.d.ts",
+    "package/dist/index.js",
+    "package/dist/inspection.d.ts",
+    "package/dist/inspection.js",
+    "package/dist/internal/cloudflare-send.d.ts",
+    "package/dist/internal/cloudflare-send.js",
+    "package/dist/internal/contracts.d.ts",
+    "package/dist/internal/contracts.js",
+    "package/dist/internal/owner.d.ts",
+    "package/dist/internal/owner.js",
+    "package/dist/internal/policy.d.ts",
+    "package/dist/internal/policy.js",
+    "package/dist/internal/post-contract.d.ts",
+    "package/dist/internal/post-contract.js",
+    "package/dist/internal/post-execution.d.ts",
+    "package/dist/internal/post-execution.js",
+    "package/dist/internal/post-sql.d.ts",
+    "package/dist/internal/post-sql.js",
+    "package/dist/internal/receipt-schema.d.ts",
+    "package/dist/internal/receipt-schema.js",
+    "package/dist/post-d1.d.ts",
+    "package/dist/post-d1.js",
+    "package/dist/post-outbox.d.ts",
+    "package/dist/post-outbox.js",
+    "package/dist/post-postgres.d.ts",
+    "package/dist/post-postgres.js",
+    "package/dist/post.d.ts",
+    "package/dist/post.js",
+    "package/dist/testing.d.ts",
+    "package/dist/testing.js",
+    "package/docs/api/README.md",
+    "package/docs/api/cloudflare.md",
+    "package/docs/api/email.md",
+    "package/docs/api/index.md",
+    "package/docs/api/inspection.md",
+    "package/docs/api/post-d1.md",
+    "package/docs/api/post-postgres.md",
+    "package/docs/api/post.md",
+    "package/docs/api/testing.md",
+    "package/package.json"
+  ],
+  "localDependencies": ["../cairn", "../watchdog"],
+  "runtimeFixture": "test/stranger/runtime.mjs",
+  "typecheckFixture": "test/stranger/consumer.mts",
+  "docs": {
+    "sigil": "connected",
+    "home": {
+      "lead": "Durable email and Durable Object messaging for TypeScript on Cloudflare, D1 or PostgreSQL, with an honest record of what was actually delivered.",
+      "example": {
+        "file": "home.ts",
+        "title": "Send an email and check its status",
+        "caption": "Sends one email through an in-memory node:sqlite store and a fake transport, ticks the queued dispatch, then prints the resulting status."
+      },
+      "ladder": {
+        "start": [
+          {
+            "title": "Quickstart",
+            "href": "/quickstart/",
+            "description": "Send one email through an in-memory store and tick it to dispatch."
+          },
+          {
+            "title": "Core concepts",
+            "href": "/concepts/#core-concepts",
+            "description": "Emails and Messages, acceptance, replay and dispatch evidence."
+          }
+        ],
+        "tasks": [
+          {
+            "title": "Run on Cloudflare Durable Objects",
+            "href": "/api/cloudflare/",
+            "description": "createCloudflareCarrier wires storage, alarms and the Email Service binding."
+          },
+          {
+            "title": "Send ordered events to a Durable Object",
+            "href": "/concepts/#post",
+            "description": "Post delivers typed envelopes to a named recipient with retries and dead letters."
+          },
+          {
+            "title": "Inspect delivery without a dashboard",
+            "href": "/concepts/#operator-inspection",
+            "description": "Read-only email and Post inspection for a host that has already admitted an operator."
+          },
+          {
+            "title": "Run Post on D1 or PostgreSQL",
+            "href": "/api/post-d1/",
+            "description": "Shared-database Post adapters for producers outside Durable Objects."
+          }
+        ],
+        "reference": [
+          {
+            "title": "API reference",
+            "href": "/api/",
+            "description": "Email, cloudflare, inspection, post, post-d1 and post-postgres entrypoints."
+          },
+          {
+            "title": "Install",
+            "href": "/install/",
+            "description": "Entrypoints, peer packages and the databases each adapter needs."
+          },
+          {
+            "title": "Status and limits",
+            "href": "/status/",
+            "description": "Retry schedule, recipient caps and error codes."
+          }
+        ]
+      }
+    }
+  }
+}
