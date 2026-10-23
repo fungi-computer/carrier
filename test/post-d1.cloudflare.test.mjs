@@ -9,7 +9,7 @@ import { createD1Post, postD1Schema, purgeD1Post } from "../src/post-d1.js";
 import { definePostRoute } from "../src/post.js";
 import { sqlPostLaws } from "./sql-post-laws.fixture.js";
 
-async function open() {
+async function open(retry) {
   const database = env.POST_DB;
   for (const table of ["producer_facts", "carrier_post_rows", "watchdog_jobs"])
     await database.prepare(`DROP TABLE IF EXISTS ${table}`).run();
@@ -46,13 +46,16 @@ async function open() {
       execute: (job, signal) => post.execute(job, signal),
       wake: { recompute: () => Promise.resolve() },
     });
-    const post = createD1Post({
+    const options = {
       database,
       watchdog,
       routes,
       now: () => clock.now,
       scheduleWake: () => Promise.resolve(),
-    });
+    };
+    const post = createD1Post(
+      retry === undefined ? options : { ...options, retry },
+    );
     return { watchdog, post };
   };
   const { watchdog, post } = reopen();

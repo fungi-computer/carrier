@@ -1,13 +1,16 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { backoffDelay, type RetryPolicy } from "@fungi.computer/almanac";
 
 const PageSize = 64;
 /** Maximum receiver attempts retained from BirdDog. */
 export const maxDeliveryAttempts = 20;
 
-/** BirdDog's retained bounded retry schedule. */
-export const retryDelay = (attempts: number): number =>
-  Math.min(2_000 * 2 ** Math.max(0, attempts - 1), 300_000);
+/** BirdDog's retained receiver retry policy, shared by every Post adapter. */
+export const postRetryPolicy: RetryPolicy = {
+  baseMs: 2_000,
+  maxMs: 300_000,
+};
 
 const earlier = (a: number | undefined, b: number | undefined) =>
   b === undefined ? a : a === undefined ? b : Math.min(a, b);
@@ -39,9 +42,27 @@ export type PostOutbox<M, E> = Readonly<{
   enqueue: (message: M, at?: number) => Effect.Effect<number | undefined, E>;
   /** Attempt one bounded page and arrange the next wake. */
   drain: () => Effect.Effect<void, E>;
+  /** Earliest owed delivery, including a future retry; absent when none remain. */
+  nextWakeAt: () => Effect.Effect<number | undefined, E>;
   /** Inspect exhausted messages in an ordered page. */
   deadLetters: (limit: number, afterKey?: string) => Effect.Effect<M[], E>;
 }>;
+
+/** One durable row: a message still owed delivery, or its delivered receipt. */
+function postRowText<M>(message: Schema.Codec<M>) {
+  return Schema.fromJsonString(
+    Schema.Union([
+      Schema.Struct({
+        mail: message,
+        attempts: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+        nextAttemptAt: Schema.optional(
+          Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+        ),
+      }),
+      Schema.Struct({ state: Schema.Literal("delivered") }),
+    ]),
+  );
+}
 
 /** The same bounded delivery and receipt machinery serves Post and BirdDog. */
 export function makePostOutbox<M, E>(
@@ -56,23 +77,12 @@ export function makePostOutbox<M, E>(
     encodingFailed: () => E;
   }>,
 ): PostOutbox<M, E> {
-  const Pending = Schema.Struct({
-    mail: options.message,
-    attempts: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-    nextAttemptAt: Schema.optional(
-      Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
-    ),
-  });
-  const Row = Schema.Union([
-    Pending,
-    Schema.Struct({ state: Schema.Literal("delivered") }),
-  ]);
-  const Text = Schema.fromJsonString(Row);
+  const Text = postRowText(options.message);
   const decode = (value: string) =>
     Schema.decodeUnknownEffect(Text)(value).pipe(
       Effect.mapError(options.invalidRow),
     );
-  const encode = (row: Schema.Schema.Type<typeof Row>) =>
+  const encode = (row: Schema.Schema.Type<typeof Text>) =>
     Effect.try({
       try: () => Schema.encodeSync(Text)(row),
       catch: options.encodingFailed,
@@ -122,7 +132,7 @@ export function makePostOutbox<M, E>(
         return undefined;
       }
       const attempts = row.attempts + 1;
-      const nextAttemptAt = now + retryDelay(attempts);
+      const nextAttemptAt = now + backoffDelay(attempts, postRetryPolicy);
       yield* options.outbox.put(
         stored.key,
         yield* encode({ mail: row.mail, attempts, nextAttemptAt }),
@@ -167,5 +177,58 @@ export function makePostOutbox<M, E>(
       return dead;
     });
 
-  return { enqueue, drain, deadLetters };
+  const nextWakeAt = () =>
+    Effect.gen(function* () {
+      let afterKey: string | undefined;
+      let due: number | undefined;
+      for (;;) {
+        const rows = yield* options.outbox.list(PageSize, afterKey);
+        for (const stored of rows) {
+          // Malformed rows are discarded by drain, not deliverable work.
+          const decoded = yield* Effect.result(decode(stored.value));
+          if (decoded._tag === "Failure") continue;
+          const row = decoded.success;
+          if (!("state" in row) && row.attempts < maxDeliveryAttempts)
+            due = earlier(due, row.nextAttemptAt ?? options.now());
+        }
+        const lastKey = rows.at(-1)?.key;
+        if (rows.length < PageSize || lastKey === undefined) return due;
+        afterKey = lastKey;
+      }
+    });
+
+  return { enqueue, drain, deadLetters, nextWakeAt };
+}
+
+/**
+ * Whether any message in an outbox still awaits a delivery attempt. Delivered
+ * receipts and exhausted dead letters are retained but owe nothing more, so a
+ * host may let their owner rest.
+ */
+export function postOutboxPending<M, E>(
+  options: Readonly<{
+    message: Schema.Codec<M>;
+    outbox: Pick<PostOutboxStore<E>, "list">;
+  }>,
+): Effect.Effect<boolean, E> {
+  const Text = postRowText(options.message);
+  return Effect.gen(function* () {
+    let afterKey: string | undefined;
+    for (;;) {
+      const rows = yield* options.outbox.list(PageSize, afterKey);
+      for (const stored of rows) {
+        // A malformed row is not deliverable; the next drain discards it.
+        const decoded = yield* Effect.result(
+          Schema.decodeUnknownEffect(Text)(stored.value),
+        );
+        if (decoded._tag === "Failure") continue;
+        const row = decoded.success;
+        if (!("state" in row) && row.attempts < maxDeliveryAttempts)
+          return true;
+      }
+      const lastKey = rows.at(-1)?.key;
+      if (rows.length < PageSize || lastKey === undefined) return false;
+      afterKey = lastKey;
+    }
+  });
 }

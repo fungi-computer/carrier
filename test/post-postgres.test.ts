@@ -15,7 +15,11 @@ import {
   postPostgresSchema,
 } from "../src/post-postgres.js";
 import { definePostRoute } from "../src/post.js";
-import { sqlPostLaws, type Fixture } from "./sql-post-laws.fixture.js";
+import {
+  sqlPostLaws,
+  type Fixture,
+  type SqlPostRetry,
+} from "./sql-post-laws.fixture.js";
 
 const pg = process.env.BOTANICAL_TEST_POSTGRES_ROOT ?? "/";
 const bin = resolve(pg, "usr/lib/postgresql/16/bin");
@@ -23,11 +27,7 @@ let directory: string | undefined;
 let socketDirectory: string | undefined;
 let pool: Pool | undefined;
 
-function isPostgresAdminShutdown(
-  error: Error,
-): error is Error & { code: "57P01" } {
-  return "code" in error && error.code === "57P01";
-}
+const poolErrors: Error[] = [];
 
 beforeAll(() => {
   const scratch = resolve("../../.botanical/carrier-post");
@@ -66,46 +66,30 @@ beforeAll(() => {
     user: "postgres",
     database: "postgres",
   });
+  // Record, never ignore: an idle client dying is a test failure.
+  pool.on("error", (error) => poolErrors.push(error));
 }, 30_000);
 afterAll(async () => {
   if (directory === undefined) return;
-  let stoppingPostgres = false;
-  let unexpectedPoolError: Error | undefined;
-  const onPoolError = (error: Error): void => {
-    if (stoppingPostgres && isPostgresAdminShutdown(error)) return;
-    unexpectedPoolError ??= error;
-  };
-  pool?.on("error", onPoolError);
-  {
-    try {
-      try {
-        // Drain checked-out and idle clients before stopping the server.
-        await pool?.end();
-      } finally {
-        if (existsSync(`${directory}/data/postmaster.pid`)) {
-          stoppingPostgres = true;
-          try {
-            execFileSync(
-              `${bin}/pg_ctl`,
-              ["-D", `${directory}/data`, "-m", "fast", "-w", "stop"],
-              { stdio: "ignore", timeout: 20_000 },
-            );
-          } finally {
-            stoppingPostgres = false;
-          }
-        }
-      }
-    } finally {
-      pool?.off("error", onPoolError);
-      rmSync(directory, { recursive: true, force: true });
-      if (socketDirectory !== undefined)
-        rmSync(socketDirectory, { recursive: true, force: true });
-    }
+  try {
+    // End every client before the server goes away, so none is killed (57P01).
+    await pool?.end();
+    if (existsSync(`${directory}/data/postmaster.pid`))
+      execFileSync(
+        `${bin}/pg_ctl`,
+        ["-D", `${directory}/data`, "-m", "fast", "-w", "stop"],
+        { stdio: "ignore", timeout: 20_000 },
+      );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+    if (socketDirectory !== undefined)
+      rmSync(socketDirectory, { recursive: true, force: true });
   }
-  if (unexpectedPoolError !== undefined) throw unexpectedPoolError;
+  const [firstError] = poolErrors;
+  if (firstError !== undefined) throw firstError;
 });
 
-const openFixture = async (): Promise<Fixture> => {
+const openFixture = async (retry?: SqlPostRetry): Promise<Fixture> => {
   const database = pool;
   if (database === undefined)
     throw new Error("Postgres fixture was not started");
@@ -143,13 +127,16 @@ const openFixture = async (): Promise<Fixture> => {
       execute: (job, signal) => post.execute(job, signal),
       wake: { recompute: () => Promise.resolve() },
     });
-    const post = createPostgresPost({
+    const options = {
       database,
       watchdog,
       routes,
       now: () => clock.now,
       scheduleWake: () => Promise.resolve(),
-    });
+    };
+    const post = createPostgresPost(
+      retry === undefined ? options : { ...options, retry },
+    );
     return { watchdog, post };
   };
   const { watchdog, post } = reopen();

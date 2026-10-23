@@ -118,6 +118,7 @@ Durable, string-backed rows. A delivered receipt must outlive source replay.
 type PostOutbox<M, E> = Readonly<{
   enqueue: (message, at?) => Effect.Effect<number | undefined, E>;
   drain: () => Effect.Effect<void, E>;
+  nextWakeAt: () => Effect.Effect<number | undefined, E>;
   deadLetters: (limit, afterKey?) => Effect.Effect<M[], E>;
 }>;
 ```
@@ -368,26 +369,6 @@ Persisted Post row parser.
 
 ## Functions
 
-### retryDelay()
-
-```ts
-function retryDelay(attempts): number;
-```
-
-BirdDog's retained bounded retry schedule.
-
-#### Parameters
-
-| Parameter  | Type     |
-| ---------- | -------- |
-| `attempts` | `number` |
-
-#### Returns
-
-`number`
-
----
-
 ### makePostOutbox()
 
 ```ts
@@ -412,6 +393,35 @@ The same bounded delivery and receipt machinery serves Post and BirdDog.
 #### Returns
 
 [`PostOutbox`](#postoutbox)\<`M`, `E`\>
+
+---
+
+### postOutboxPending()
+
+```ts
+function postOutboxPending<M, E>(options): Effect<boolean, E>;
+```
+
+Whether any message in an outbox still awaits a delivery attempt. Delivered
+receipts and exhausted dead letters are retained but owe nothing more, so a host
+may let their owner rest.
+
+#### Type Parameters
+
+| Type Parameter |
+| -------------- |
+| `M`            |
+| `E`            |
+
+#### Parameters
+
+| Parameter | Type                                                                                                                              |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `options` | `Readonly`\<\{ `message`: `Schema.Codec`\<`M`\>; `outbox`: `Pick`\<[`PostOutboxStore`](#postoutboxstore)\<`E`\>, `"list"`\>; \}\> |
+
+#### Returns
+
+`Effect`\<`boolean`, `E`\>
 
 ---
 
@@ -534,37 +544,6 @@ Preserve each route's inferred address and event types in a registry.
 (`envelope`) => `Promise`\<...\>; \}\>; \}\>; `recordCursor?`: (`envelope`,
 `cursor`) => `void`; `recordRefused?`: (`envelope`) => `void`; \}\>, `"address"`
 \| `"event"`\>
-
----
-
-### migratePostEvents()
-
-```ts
-function migratePostEvents<A, AI, B, BI>(options): void;
-```
-
-Migrate persisted ordinary events once, before opening their producer. Carrier
-preserves delivery evidence, ordering and Watchdog job identities. A failed
-decoder or transform rolls back both rows and the migration receipt.
-
-#### Type Parameters
-
-| Type Parameter |
-| -------------- |
-| `A`            |
-| `AI`           |
-| `B`            |
-| `BI`           |
-
-#### Parameters
-
-| Parameter | Type                                                                                                                                                                                                            |
-| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `options` | `Readonly`\<\{ `owner`: `WatchdogSqliteOwner`; `id`: `string`; `kind`: `string`; `toKind?`: `string`; `from`: `Schema.Codec`\<`A`, `AI`\>; `to`: `Schema.Codec`\<`B`, `BI`\>; `migrate`: (`event`) => `B`; \}\> |
-
-#### Returns
-
-`void`
 
 ---
 

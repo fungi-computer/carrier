@@ -1,4 +1,5 @@
 import * as Schema from "effect/Schema";
+import { backoffDelay } from "@fungi.computer/almanac";
 import { defineIdFamily } from "@fungi.computer/cairn";
 import type { WatchdogRunningJob } from "@fungi.computer/watchdog";
 import {
@@ -13,7 +14,7 @@ import {
   postDisposition,
   deliveryReceipt,
 } from "./post-execution.js";
-import { maxDeliveryAttempts, retryDelay } from "../post-outbox.js";
+import { maxDeliveryAttempts, postRetryPolicy } from "../post-outbox.js";
 
 export type Value = string | number | null;
 export type Statement = Readonly<{ text: string; values: readonly Value[] }>;
@@ -216,15 +217,15 @@ export function openSqlPost<R extends Record<string, PostRegistryRoute>>(
   )(
     options.retry ?? {
       maxAttempts: maxDeliveryAttempts,
-      baseDelayMs: retryDelay(1),
-      maxDelayMs: retryDelay(maxDeliveryAttempts),
+      baseDelayMs: backoffDelay(1, postRetryPolicy),
+      maxDelayMs: backoffDelay(maxDeliveryAttempts, postRetryPolicy),
     },
   );
   const delay = (attempt: number) =>
-    Math.min(
-      policy.baseDelayMs * 2 ** Math.max(0, attempt - 1),
-      policy.maxDelayMs,
-    );
+    backoffDelay(attempt, {
+      baseMs: policy.baseDelayMs,
+      maxMs: policy.maxDelayMs,
+    });
   const retrySql = Array.from(
     { length: policy.maxAttempts },
     (_, index) => `WHEN ${String(index)} THEN ${String(delay(index + 1))}`,

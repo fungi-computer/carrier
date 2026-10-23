@@ -47,9 +47,13 @@
     "package/docs/api/testing.md",
     "package/package.json"
   ],
-  "localDependencies": ["../cairn", "../watchdog"],
+  "localDependencies": ["../almanac", "../cairn", "../watchdog"],
   "runtimeFixture": "test/stranger/runtime.mjs",
-  "typecheckFixture": "test/stranger/consumer.mts",
+  "typechecks": [
+    {
+      "fixture": "test/stranger/consumer.mts"
+    }
+  ],
   "docs": {
     "sigil": "connected",
     "home": {

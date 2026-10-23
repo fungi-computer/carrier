@@ -97,7 +97,8 @@ In a Durable Object, `ctx.storage` is already the SQLite owner.
 `createMemoryOutbox()` stores encoded string rows in process memory for tests
 and quick starts. It provides `put`, `read`, key-ordered `list(limit, afterKey)`
 and `delete`. Each instance is independent; it is not durable storage. BirdDog’s
-[quick start](../bird-dog/README.md#quick-start) uses this helper.
+[quick start](https://docs.fungi.computer/bird-dog/quickstart/) uses this
+helper.
 
 ```ts
 import { createMemoryOutbox } from "@fungi.computer/carrier/testing";
@@ -214,6 +215,12 @@ ambiguous first dispatch has zero. Post `attempts` counts receiver invocations.
 
 ## Post
 
+Post uses Almanac's shared pure backoff calculation with its retained policy: 2
+seconds initially, doubling to a 5-minute cap, with at most 20 receiver
+attempts. The synchronous and SQL adapters share that default policy; explicit
+SQL retry policies retain their own delays. Almanac supplies arithmetic only,
+not a second scheduler or retry owner.
+
 `@fungi.computer/carrier/post` delivers typed, point-to-point envelopes between
 named Durable Objects. `definePostRoute` pairs each address schema and event
 schema with its Durable Object namespace, name function and fixed `addressKind`
@@ -264,7 +271,11 @@ its reason and its attempt count. `deadLetters` returns `letters` and
 
 The same retry and receipt machinery is exported as `makePostOutbox` for a
 string-backed outbox. [BirdDog](../bird-dog/README.md) uses it for agent reply
-delivery.
+delivery. `postOutboxPending` reports whether such an outbox still owes any
+message a delivery attempt; receipts and exhausted dead letters owe nothing. Its
+`nextWakeAt()` reads the earliest owed delivery across the retained rows,
+including future retries. Delivered receipts, exhausted dead letters and
+malformed rows do not request a wake.
 
 ## Post transactions on D1 and PostgreSQL
 

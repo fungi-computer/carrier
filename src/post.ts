@@ -22,9 +22,10 @@ import type {
   WatchdogTransactionalProjection,
 } from "@fungi.computer/watchdog";
 
-import { maxDeliveryAttempts, retryDelay } from "./post-outbox.js";
+import { backoffDelay } from "@fungi.computer/almanac";
+import { maxDeliveryAttempts, postRetryPolicy } from "./post-outbox.js";
 
-export { makePostOutbox, retryDelay } from "./post-outbox.js";
+export { makePostOutbox, postOutboxPending } from "./post-outbox.js";
 export type { PostOutbox, PostOutboxStore } from "./post-outbox.js";
 
 const Key = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256));
@@ -496,7 +497,8 @@ export function createPost<R extends Record<string, PostRegistryRoute>>(
         return undefined;
       }
       const attempts = row.attempts + 1;
-      const nextAttemptAt = options.now() + retryDelay(attempts);
+      const nextAttemptAt =
+        options.now() + backoffDelay(attempts, postRetryPolicy);
       const started = { ...row, attempts, nextAttemptAt };
       // Preserve recovery evidence before invoking the receiver. A failed receipt
       // write leaves this row available for retry after Watchdog settles the job.
@@ -547,7 +549,8 @@ export function createPost<R extends Record<string, PostRegistryRoute>>(
           route.recordRefused?.(evidence.envelope);
         finish(postKey, current, disposition, deliveryReceipt(evidence));
       } else {
-        const due = options.now() + retryDelay(current.attempts);
+        const due =
+          options.now() + backoffDelay(current.attempts, postRetryPolicy);
         if (due !== current.nextAttemptAt) {
           putRow(postKey, { ...current, nextAttemptAt: due });
           retryAt = due;

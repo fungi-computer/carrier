@@ -1,6 +1,6 @@
 {
   "name": "@fungi.computer/carrier",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "author": "Levi <levi@technomancy.dev>",
   "description": "Durable email submission and recipient delivery tracking",
   "type": "module",
@@ -64,6 +64,7 @@
   },
   "dependencies": {
     "@cloudflare/workers-types": "5.20260828.1",
+    "@fungi.computer/almanac": "workspace:*",
     "@fungi.computer/cairn": "workspace:*",
     "@fungi.computer/watchdog": "workspace:*",
     "effect": "4.0.2",

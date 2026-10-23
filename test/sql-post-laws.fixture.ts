@@ -4,8 +4,16 @@ import type {
   WatchdogQueuedJob,
 } from "@fungi.computer/watchdog";
 import type { AsyncWatchdogRuntime } from "@fungi.computer/watchdog/d1";
-import type { PostEnvelope, PostDeliveryResult } from "../src/post.js";
-import type { SqlPostRuntime } from "../src/post-d1.js";
+import type {
+  PostEnvelope,
+  PostDeliveryResult,
+  PostRegistryRoute,
+} from "../src/post.js";
+import type { SqlPostOptions, SqlPostRuntime } from "../src/post-d1.js";
+
+export type SqlPostRetry = NonNullable<
+  SqlPostOptions<Record<string, PostRegistryRoute>>["retry"]
+>;
 
 export type Fixture = Readonly<{
   watchdog: AsyncWatchdogRuntime;
@@ -35,7 +43,45 @@ const envelope = (key = "one", text = "hello"): PostEnvelope => ({
   event: { text },
 });
 
-export function sqlPostLaws(open: () => Promise<Fixture>) {
+export function sqlPostLaws(open: (retry?: SqlPostRetry) => Promise<Fixture>) {
+  it.each([
+    {
+      name: "retained default",
+      retry: undefined,
+      delays: [
+        2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 300_000,
+      ],
+    },
+    {
+      name: "explicit family policy",
+      retry: { maxAttempts: 20, baseDelayMs: 17, maxDelayMs: 45 },
+      delays: [17, 34, 45],
+    },
+  ])(
+    "preserves $name retry timestamps across reopen",
+    async ({ retry, delays }) => {
+      const f = await open(retry);
+      try {
+        f.receiver.run = () => Promise.reject(new Error("retry"));
+        await f.commit(envelope());
+        for (const [index, delay] of delays.entries()) {
+          const due = f.clock.now + delay;
+          await f.watchdog.tick();
+          expect(await f.post.read("one")).toMatchObject({
+            state: "pending",
+            attempts: index + 1,
+            nextAttemptAt: due,
+          });
+          if (index < delays.length - 1) {
+            f.clock.now = due;
+            await f.reopen().post.enqueueDue();
+          }
+        }
+      } finally {
+        await f.close();
+      }
+    },
+  );
   it("retains the receiver's parsed receipt with its terminal delivery", async () => {
     const f = await open();
     try {
