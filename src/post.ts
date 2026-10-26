@@ -34,6 +34,7 @@ const PageLimit = Schema.Int.check(
   Schema.isGreaterThanOrEqualTo(1),
   Schema.isLessThanOrEqualTo(64),
 );
+const maxRouteDeadlineMs = 7 * 24 * 60 * 60 * 1_000;
 const ids = defineIdFamily({
   family: "post",
   version: 1,
@@ -54,6 +55,9 @@ export const PostRowSchema = Schema.fromJsonString(
       envelope: PostEnvelopeSchema,
       attempts: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
       nextAttemptAt: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+      deadlineAt: Schema.optional(
+        Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+      ),
       jobId: Schema.optional(Key),
       delivery: Schema.optional(PostEnvelopeSchema),
       nextKey: Schema.optional(Key),
@@ -67,7 +71,10 @@ export const PostRowSchema = Schema.fromJsonString(
       state: Schema.Literal("dead"),
       envelope: PostEnvelopeSchema,
       attempts: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-      reason: Schema.Literals(["refused", "exhausted"]),
+      reason: Schema.Literals(["refused", "exhausted", "expired"]),
+      deadlineAt: Schema.optional(
+        Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+      ),
       receipt: Schema.optional(Schema.Json),
       delivery: Schema.optional(PostEnvelopeSchema),
       nextKey: Schema.optional(Key),
@@ -84,6 +91,8 @@ export type PostRow = Schema.Schema.Type<typeof PostRowSchema>;
 export type PostRoute<A, E, D = E, AI = A, EI = E, DI = EI> = Readonly<{
   /** Fixed registry label shared by routes to one recipient namespace. */
   addressKind: string;
+  /** Optional SQLite Post lifetime of 1 ms to 7 days from admission; relational adapters reject it. */
+  deadlineMs?: number | undefined;
   /** Address parser for this kind. */
   address: Schema.Codec<A, AI>;
   /** Staged event parser for this kind. */
@@ -140,6 +149,8 @@ type PostReceiptHooks<A, D> = Readonly<{
 export type PostRegistryRoute = Readonly<{
   /** Recipient namespace identity used for per-address ordering. */
   addressKind: string;
+  /** Optional SQLite Post lifetime of 1 ms to 7 days from admission; relational adapters reject it. */
+  deadlineMs?: number | undefined;
   /** Parser for this address kind. */
   address: Schema.Codec<unknown, unknown>;
   /** Parser for this event kind. */
@@ -230,6 +241,12 @@ export function definePostRoute<A, E, D = E, AI = A, EI = E, DI = EI>(
       ? receiptOperations(route.address, route.event, route)
       : receiptOperations(route.address, route.prepare.event, route);
   const prepare = route.prepare;
+  if (route.deadlineMs !== undefined)
+    Schema.decodeUnknownSync(
+      Schema.Int.check(
+        Schema.isBetween({ minimum: 1, maximum: maxRouteDeadlineMs }),
+      ),
+    )(route.deadlineMs);
   return {
     ...route,
     ...delivery,
@@ -327,14 +344,19 @@ export type PostRuntime<R extends Record<string, PostRegistryRoute>> =
       limit?: number,
       afterKey?: string,
     ) => Promise<string | undefined>;
-    /** Read an ordered page of refused or exhausted keys for operators. */
+    /** Release settled pending retries from backoff without resetting attempts. */
+    releaseNow: (
+      limit?: number,
+      afterKey?: string,
+    ) => Promise<string | undefined>;
+    /** Read an ordered page of refused, exhausted or expired keys for operators. */
     deadLetters: (
       limit?: number,
       afterKey?: string,
     ) => Readonly<{
       letters: readonly Readonly<{
         key: string;
-        reason: "refused" | "exhausted";
+        reason: "refused" | "exhausted" | "expired";
         envelope: PostEnvelope;
         attempts: number;
       }>[];
@@ -418,12 +440,17 @@ export function createPost<R extends Record<string, PostRegistryRoute>>(
     const previousKey = store.read(tailKey(queue));
     const previous =
       previousKey === undefined ? undefined : readRow(previousKey);
-    const row = {
+    const admittedAt = options.now();
+    const baseRow = {
       state: "pending",
       envelope,
       attempts: 0,
-      nextAttemptAt: options.now(),
+      nextAttemptAt: admittedAt,
     } as const;
+    const row =
+      route.deadlineMs === undefined
+        ? baseRow
+        : { ...baseRow, deadlineAt: admittedAt + route.deadlineMs };
     putRow(envelope.key, row);
     if (previousKey !== undefined && previous?.state === "pending") {
       putRow(previousKey, { ...previous, nextKey: envelope.key });
@@ -463,7 +490,10 @@ export function createPost<R extends Record<string, PostRegistryRoute>>(
       | Readonly<{
           state: "delivered";
         }>
-      | Readonly<{ state: "dead"; reason: "refused" | "exhausted" }>,
+      | Readonly<{
+          state: "dead";
+          reason: "refused" | "exhausted" | "expired";
+        }>,
     metadata?: Schema.Json,
   ) => {
     let receipt: PostRow;
@@ -473,8 +503,14 @@ export function createPost<R extends Record<string, PostRegistryRoute>>(
         envelope: row.envelope,
         attempts: row.attempts,
       };
+      const settled =
+        row.deadlineAt === undefined
+          ? dead
+          : { ...dead, deadlineAt: row.deadlineAt };
       receipt =
-        row.delivery === undefined ? dead : { ...dead, delivery: row.delivery };
+        row.delivery === undefined
+          ? settled
+          : { ...settled, delivery: row.delivery };
     } else receipt = terminal;
     if (metadata !== undefined) receipt = { ...receipt, receipt: metadata };
     putRow(
@@ -492,13 +528,19 @@ export function createPost<R extends Record<string, PostRegistryRoute>>(
       const row = readRow(postKey);
       if (row === undefined) throw new PostError("delivery row is missing");
       if (row.state !== "pending" || row.jobId !== job.jobId) return undefined;
-      if (row.attempts >= maxDeliveryAttempts) {
+      if (row.deadlineAt !== undefined && options.now() >= row.deadlineAt) {
+        finish(postKey, row, { state: "dead", reason: "expired" });
+        return undefined;
+      }
+      if (row.deadlineAt === undefined && row.attempts >= maxDeliveryAttempts) {
         finish(postKey, row, { state: "dead", reason: "exhausted" });
         return undefined;
       }
       const attempts = row.attempts + 1;
-      const nextAttemptAt =
-        options.now() + backoffDelay(attempts, postRetryPolicy);
+      const nextAttemptAt = Math.min(
+        options.now() + backoffDelay(attempts, postRetryPolicy),
+        row.deadlineAt ?? Number.POSITIVE_INFINITY,
+      );
       const started = { ...row, attempts, nextAttemptAt };
       // Preserve recovery evidence before invoking the receiver. A failed receipt
       // write leaves this row available for retry after Watchdog settles the job.
@@ -530,6 +572,12 @@ export function createPost<R extends Record<string, PostRegistryRoute>>(
         route,
         current.attempts,
         maxDeliveryAttempts,
+        {
+          deadlineExpired:
+            current.deadlineAt !== undefined &&
+            options.now() >= current.deadlineAt,
+          retryUntilDeadline: current.deadlineAt !== undefined,
+        },
       );
       if (disposition.state === "keep") return;
       if (disposition.state === "delivered") {
@@ -549,11 +597,18 @@ export function createPost<R extends Record<string, PostRegistryRoute>>(
           route.recordRefused?.(evidence.envelope);
         finish(postKey, current, disposition, deliveryReceipt(evidence));
       } else {
-        const due =
-          options.now() + backoffDelay(current.attempts, postRetryPolicy);
-        if (due !== current.nextAttemptAt) {
-          putRow(postKey, { ...current, nextAttemptAt: due });
-          retryAt = due;
+        const now = options.now();
+        if (current.deadlineAt !== undefined && now >= current.deadlineAt) {
+          finish(postKey, current, { state: "dead", reason: "expired" });
+        } else {
+          const due = Math.min(
+            now + backoffDelay(current.attempts, postRetryPolicy),
+            current.deadlineAt ?? Number.POSITIVE_INFINITY,
+          );
+          if (due !== current.nextAttemptAt) {
+            putRow(postKey, { ...current, nextAttemptAt: due });
+            retryAt = due;
+          }
         }
       }
     });
@@ -581,7 +636,18 @@ export function createPost<R extends Record<string, PostRegistryRoute>>(
       store.commit(() => {
         const current = readRow(row.envelope.key);
         if (current?.state !== "pending" || current.jobId !== row.jobId) return;
-        if (current.attempts >= maxDeliveryAttempts)
+        if (
+          current.deadlineAt !== undefined &&
+          options.now() >= current.deadlineAt
+        )
+          finish(current.envelope.key, current, {
+            state: "dead",
+            reason: "expired",
+          });
+        else if (
+          current.deadlineAt === undefined &&
+          current.attempts >= maxDeliveryAttempts
+        )
           finish(current.envelope.key, current, {
             state: "dead",
             reason: "exhausted",
@@ -616,13 +682,17 @@ export function createPost<R extends Record<string, PostRegistryRoute>>(
         putRow(key, pending);
         if (current.jobId !== undefined) enqueueJob(pending);
       } else {
-        const pending = {
+        const retry = {
           state: "pending" as const,
           envelope: current.envelope,
           attempts: 0,
           nextAttemptAt: options.now(),
           delivery: current.delivery,
         };
+        const pending =
+          current.deadlineAt === undefined
+            ? retry
+            : { ...retry, deadlineAt: current.deadlineAt };
         putRow(key, pending);
         const queue = queueOf(pending.envelope);
         const previousKey = store.read(tailKey(queue));
@@ -637,6 +707,51 @@ export function createPost<R extends Record<string, PostRegistryRoute>>(
       }
     });
     await options.scheduleWake(options.now());
+  };
+
+  const releasePendingRow = async (
+    row: PostRow,
+    now: number,
+  ): Promise<boolean> => {
+    if (
+      row.state !== "pending" ||
+      row.jobId === undefined ||
+      row.nextAttemptAt <= now
+    )
+      return false;
+    const work = await options.readJob(row.jobId);
+    if (work.status === "missing")
+      throw new PostError("delivery job is missing");
+    if (work.job.state !== "settled") return false;
+    return store.commit(() => {
+      const current = readRow(row.envelope.key);
+      if (
+        current?.state !== "pending" ||
+        current.jobId !== row.jobId ||
+        current.nextAttemptAt <= now
+      )
+        return false;
+      const pending = { ...current, nextAttemptAt: now };
+      putRow(row.envelope.key, pending);
+      enqueueJob(pending);
+      return true;
+    });
+  };
+
+  const releaseNow: PostRuntime<R>["releaseNow"] = async (
+    limit = 64,
+    afterKey,
+  ) => {
+    const pageSize = Schema.decodeUnknownSync(PageLimit)(limit);
+    const rows = store.list(pageSize, afterKey);
+    const now = options.now();
+    let released = false;
+    for (const stored of rows) {
+      const row = Schema.decodeUnknownSync(PostRowSchema)(stored.value);
+      released = (await releasePendingRow(row, now)) || released;
+    }
+    if (released) await options.scheduleWake(now);
+    return rows.length === pageSize ? rows.at(-1)?.key : undefined;
   };
 
   const deadLetters: PostRuntime<R>["deadLetters"] = (limit = 64, afterKey) => {
@@ -667,6 +782,7 @@ export function createPost<R extends Record<string, PostRegistryRoute>>(
     retry,
     execute,
     enqueueDue,
+    releaseNow,
     deadLetters,
     read: readRow,
     nextWake,

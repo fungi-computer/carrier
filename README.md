@@ -215,20 +215,26 @@ ambiguous first dispatch has zero. Post `attempts` counts receiver invocations.
 
 ## Post
 
-Post uses Almanac's shared pure backoff calculation with its retained policy: 2
+Post's ordinary retry policy uses Almanac's shared pure backoff calculation: 2
 seconds initially, doubling to a 5-minute cap, with at most 20 receiver
 attempts. The synchronous and SQL adapters share that default policy; explicit
-SQL retry policies retain their own delays. Almanac supplies arithmetic only,
-not a second scheduler or retry owner.
+SQL retry policies retain their own delays. A SQLite route with `deadlineMs`
+uses its finite lifetime instead of the attempt ceiling. Almanac supplies
+arithmetic only, not a second scheduler or retry owner.
 
 `@fungi.computer/carrier/post` delivers typed, point-to-point envelopes between
 named Durable Objects. `definePostRoute` pairs each address schema and event
 schema with its Durable Object namespace, name function and fixed `addressKind`
-label. Every event route to the same namespace shares that label, so different
-event kinds for one recipient keep producer order. The receiver implements
-`deliver(envelope)` and calls `admitPost` inside its own SQLite transaction, so
-the event mutation and admission receipt commit together. Keys must identify the
-producing event across all senders to that receiver.
+label. A SQLite-backed route may opt into a retry lifetime of at most seven days
+with `deadlineMs`; Post stores its absolute deadline at admission and settles an
+undelivered row as an `expired` dead letter when the deadline is reached.
+Deadline routes retry until expiry rather than using the ordinary attempt
+ceiling. Omitted deadlines preserve the existing retry budget. Every event route
+to the same namespace shares that label, so different event kinds for one
+recipient keep producer order. The receiver implements `deliver(envelope)` and
+calls `admitPost` inside its own SQLite transaction, so the event mutation and
+admission receipt commit together. Keys must identify the producing event across
+all senders to that receiver.
 
 Construct `createPost` with the producer's structural SQLite `owner`, typed
 `routes`, Watchdog's `transactional` projection and `readJob` operation, a
@@ -265,9 +271,10 @@ acknowledge a domain ledger in the same producer transaction as the Post
 receipt. An acknowledgment failure leaves both pending for retry. Prepared facts
 should carry sealed grants, never raw credentials.
 
-A definite refusal or an exhausted retry budget keeps a dead-letter envelope,
-its reason and its attempt count. `deadLetters` returns `letters` and
-`nextCursor`, including a continuation through pages that contain only receipts.
+A definite refusal, an exhausted retry budget or a route deadline keeps a
+dead-letter envelope, its reason and its attempt count. `deadLetters` returns
+`letters` and `nextCursor`, including a continuation through pages that contain
+only receipts.
 
 The same retry and receipt machinery is exported as `makePostOutbox` for a
 string-backed outbox. [BirdDog](../bird-dog/README.md) uses it for agent reply
@@ -280,9 +287,13 @@ malformed rows do not request a wake.
 ## Post transactions on D1 and PostgreSQL
 
 `@fungi.computer/carrier/post-d1` and `/post-postgres` bind the ordinary Post
-address and event registry to Watchdog's database adapters. Apply `postD1Schema`
-or `postPostgresSchema` alongside the matching Watchdog schema through your
-migration tool.
+address and event registry to Watchdog's database adapters. These relational
+adapters preserve their existing schema and retry contract and do not support
+route deadlines. Constructing either adapter with a route that sets `deadlineMs`
+throws `PostError` with `reason: "relational-deadline-unsupported"` before
+database access. Use SQLite-backed Post for deadline routes. Apply
+`postD1Schema` or `postPostgresSchema` alongside the matching Watchdog schema
+through your migration tool.
 
 On D1, `post.send(envelope)` returns the envelope and job statements. Include
 both in the same `database.batch` as the producer fact. `sendFromSelect` accepts

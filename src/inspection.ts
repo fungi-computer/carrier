@@ -42,7 +42,7 @@ export const PostReceiptSummarySchema = Schema.Union([
     state: Schema.Literal("dead"),
     kind: Key,
     attempts: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-    reason: Schema.Literals(["refused", "exhausted"]),
+    reason: Schema.Literals(["refused", "exhausted", "expired"]),
   }),
 ]);
 /** Metadata for one retained Post row. */

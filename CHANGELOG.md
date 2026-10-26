@@ -1,5 +1,16 @@
 # @fungi.computer/carrier
 
+## 0.2.0
+
+### Minor Changes
+
+- Changes since 0.1.0:
+
+  - fix(mesh): close relay custody review gaps
+  - fix(carrier): export the Post disposition type its function returns
+  - fix(carrier): retry route deadlines until expiry
+  - feat(carrier): support per-route Post deadlines
+
 ## 0.1.0
 
 ### Minor Changes

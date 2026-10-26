@@ -36,7 +36,7 @@ const Job = Schema.Struct({
   payload_json: Schema.fromJsonString(Schema.Unknown),
 });
 
-/** Bind the Post registry to a PostgreSQL owner and the shared delivery engine. */
+/** Bind the Post registry to PostgreSQL; route deadlines are rejected with PostError. */
 export function createPostgresPost<R extends Record<string, PostRegistryRoute>>(
   options: SqlPostOptions<R> &
     Readonly<{

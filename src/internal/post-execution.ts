@@ -12,6 +12,12 @@ export type DeliveryEvidence = Readonly<{
   envelope: PostEnvelope | undefined;
   failure?: unknown;
 }>;
+/** The settlement a delivery attempt resolves to; internal to the Post backends. */
+export type PostDisposition =
+  | Readonly<{ state: "dead"; reason: "refused" | "exhausted" | "expired" }>
+  | Readonly<{ state: "pending" }>
+  | Readonly<{ state: "delivered"; cursor?: number }>
+  | Readonly<{ state: "keep" }>;
 
 /** Shared preparation, bounded receiver I/O and response decoding for every Post backend. */
 export async function deliverPost(
@@ -65,10 +71,16 @@ export function postDisposition(
   route: PostRegistryRoute,
   attempts: number,
   maxAttempts: number,
-) {
+  options: Readonly<{
+    deadlineExpired?: boolean;
+    retryUntilDeadline?: boolean;
+  }> = {},
+): PostDisposition {
   const { result, envelope } = evidence;
+  if (result === "unavailable" && options.deadlineExpired === true)
+    return { state: "dead", reason: "expired" };
   if (result === "unavailable")
-    return attempts >= maxAttempts
+    return !options.retryUntilDeadline && attempts >= maxAttempts
       ? ({ state: "dead", reason: "exhausted" } as const)
       : ({ state: "pending" } as const);
   if (envelope === undefined) throw new PostError("missing delivered fact");

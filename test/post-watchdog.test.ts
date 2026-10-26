@@ -157,6 +157,72 @@ it("joins producer SQLite atomically and recovers a failed receipt without apply
   }
 });
 
+it("releases a settled Post retry now without resetting its attempt count", async () => {
+  const producer = createSqliteOwnerFixture();
+  try {
+    const now = 1_000;
+    let available = false;
+    let execute: WatchdogExecutor = () =>
+      Promise.reject(new Error("Post is not open"));
+    const watchdog = await Watchdog.make({
+      owner: producer.owner,
+      execute: (job, signal) => execute(job, signal),
+      isAlive: () => Promise.resolve(false),
+      wake: { recompute: () => Promise.resolve() },
+    });
+    const route = definePostRoute({
+      addressKind: "team",
+      address: Schema.Struct({ teamId: Schema.String }),
+      event: Event,
+      name: ({ teamId }) => teamId,
+      namespace: {
+        getByName: () => ({
+          deliver: () =>
+            available
+              ? Promise.resolve("accepted")
+              : Promise.reject(new Error("recipient offline")),
+        }),
+      },
+    });
+    const post = createPost({
+      routes: { team: route },
+      owner: producer.owner,
+      transactional: watchdog.transactional,
+      readJob: watchdog.read,
+      now: () => now,
+      scheduleWake: () => Promise.resolve(),
+    });
+    execute = post.execute;
+    producer.owner.transactionSync(() => {
+      post.send({
+        key: "held",
+        kind: "team",
+        address: { teamId: "team-one" },
+        event: { text: "keep the original event" },
+      });
+    });
+
+    await watchdog.tick();
+    expect(post.read("held")).toMatchObject({
+      state: "pending",
+      attempts: 1,
+      nextAttemptAt: 3_000,
+    });
+    available = true;
+    expect(await post.releaseNow()).toBeUndefined();
+    expect(post.read("held")).toMatchObject({
+      state: "pending",
+      attempts: 1,
+      nextAttemptAt: now,
+    });
+
+    await watchdog.tick();
+    expect(post.read("held")).toMatchObject({ state: "delivered" });
+  } finally {
+    producer.close();
+  }
+});
+
 it("retries a dead letter after queued successors and expedites a settled failure without duplicating live jobs", async () => {
   const producer = createSqliteOwnerFixture();
   try {

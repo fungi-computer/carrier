@@ -40,7 +40,7 @@ export type D1Post = SqlPostRuntime &
 /** Carrier-owned D1 schema, applied by the deployment migration owner. */
 export const postD1Schema: readonly string[] = postSchema(false);
 
-/** Bind the Post registry to native D1 batch admission and the shared delivery engine. */
+/** Bind the Post registry to D1; route deadlines are rejected with PostError. */
 export function createD1Post<R extends Record<string, PostRegistryRoute>>(
   options: SqlPostOptions<R> &
     Readonly<{

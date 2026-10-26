@@ -1,26 +1,52 @@
 import { afterEach, expect, it, vi } from "vitest";
 import * as Schema from "effect/Schema";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { admitPost, createPost, definePostRoute } from "../src/post.js";
+import {
+  PostError,
+  admitPost,
+  createPost,
+  definePostRoute,
+} from "../src/post.js";
 import type { PostEnvelope } from "../src/post.js";
+import { openSqlPost } from "../src/internal/post-sql.js";
 import { deliverPost } from "../src/internal/post-execution.js";
 import type {
   WatchdogQueuedJob,
   WatchdogRunningJob,
   WatchdogReadResult,
+  WatchdogSqliteOwner,
   WatchdogTransactionalProjection,
 } from "@fungi.computer/watchdog";
 
 import { createSqliteOwnerFixture } from "../../watchdog/test/sqlite-owner.fixture.js";
 
 const fixtures: ReturnType<typeof createSqliteOwnerFixture>[] = [];
+const temporaryDirectories: string[] = [];
 afterEach(() => {
   vi.useRealTimers();
   for (const fixture of fixtures.splice(0)) fixture.close();
+  for (const directory of temporaryDirectories.splice(0))
+    rmSync(directory, { recursive: true, force: true });
 });
+const sqliteFixture = (filename?: string) => {
+  const fixture = createSqliteOwnerFixture(filename);
+  let open = true;
+  const tracked = Object.freeze({
+    owner: fixture.owner,
+    close: () => {
+      if (!open) return;
+      open = false;
+      fixture.close();
+    },
+  });
+  fixtures.push(tracked);
+  return tracked;
+};
 const sqliteOwner = () => {
-  const fixture = createSqliteOwnerFixture();
-  fixtures.push(fixture);
+  const fixture = sqliteFixture();
   return fixture.owner;
 };
 
@@ -384,6 +410,205 @@ it("bounds unavailable delivery at twenty attempts and retains inspectable dead 
     attempts: 1,
     envelope: { key: "refused", event: { text: "refuse" } },
   });
+});
+
+it("retries a seven-day route past the attempt ceiling and expires after physical SQLite reopens", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "carrier-post-deadline-"));
+  temporaryDirectories.push(directory);
+  const filename = join(directory, "post.sqlite");
+  let fixture = sqliteFixture(filename);
+  const jobs: WatchdogQueuedJob[] = [];
+  let now = 100;
+  let deliveries = 0;
+  const startAt = now;
+  const deadlineMs = 604_800_000;
+  const deadlineAt = startAt + deadlineMs;
+  const transactional: WatchdogTransactionalProjection = {
+    enqueueAcceptedJob: (job) => {
+      jobs.push(job);
+    },
+    readQueueHead: () => ({ state: "idle" }),
+    readLatestSettledJob: () => undefined,
+    recordCancellationIntent: () => ({ status: "missing" }),
+  };
+  const routes = {
+    team: definePostRoute({
+      addressKind: "team",
+      address,
+      event,
+      deadlineMs,
+      name: (to) => to.teamId,
+      namespace: {
+        getByName: () => ({
+          deliver: () => {
+            deliveries += 1;
+            return Promise.reject(new Error("offline"));
+          },
+        }),
+      },
+    }),
+  };
+  const open = (owner: WatchdogSqliteOwner) =>
+    createPost({
+      routes,
+      owner,
+      transactional,
+      readJob: (id) => settledJob(jobs, id),
+      now: () => now,
+      scheduleWake: () => Promise.resolve(),
+    });
+  let post = open(fixture.owner);
+  post.send({
+    key: "seven-day-deadline",
+    kind: "team",
+    address: { teamId: "t1" },
+    event: { text: "x" },
+  });
+
+  for (let attempts = 1; attempts <= 20; attempts += 1) {
+    await post.execute(running(jobs.at(-1)));
+    const row = post.read("seven-day-deadline");
+    expect(row).toMatchObject({
+      state: "pending",
+      attempts,
+      deadlineAt,
+    });
+    expect(post.deadLetters().letters).toEqual([]);
+    if (attempts < 20) {
+      if (row?.state !== "pending")
+        throw new Error("Expected a pending seven-day route");
+      now = row.nextAttemptAt;
+      await post.enqueueDue();
+    }
+  }
+  expect(now - startAt).toBe(3_810_000);
+  expect(deliveries).toBe(20);
+
+  fixture.close();
+  fixture = sqliteFixture(filename);
+  post = open(fixture.owner);
+  now = startAt + 6 * 24 * 60 * 60 * 1_000;
+  await post.enqueueDue();
+  await post.execute(running(jobs.at(-1)));
+  expect(post.read("seven-day-deadline")).toMatchObject({
+    state: "pending",
+    attempts: 21,
+    deadlineAt,
+  });
+  expect(post.deadLetters().letters).toEqual([]);
+  expect(deliveries).toBe(21);
+
+  fixture.close();
+  fixture = sqliteFixture(filename);
+  post = open(fixture.owner);
+  now = deadlineAt + 1;
+  const settledJobs = jobs.length;
+  await post.enqueueDue();
+  expect(post.read("seven-day-deadline")).toMatchObject({
+    state: "dead",
+    reason: "expired",
+    attempts: 21,
+    deadlineAt,
+  });
+  const letters = post.deadLetters().letters;
+  expect(letters).toHaveLength(1);
+  expect(letters).toMatchObject([
+    {
+      key: "post:seven-day-deadline",
+      reason: "expired",
+      attempts: 21,
+    },
+  ]);
+  await post.enqueueDue();
+  expect(jobs).toHaveLength(settledJobs);
+  expect(deliveries).toBe(21);
+});
+
+it("expires a route whose active delivery fails after its deadline", async () => {
+  const owner = sqliteOwner();
+  const jobs: WatchdogQueuedJob[] = [];
+  let now = 100;
+  const transactional: WatchdogTransactionalProjection = {
+    enqueueAcceptedJob: (job) => {
+      jobs.push(job);
+    },
+    readQueueHead: () => ({ state: "idle" }),
+    readLatestSettledJob: () => undefined,
+    recordCancellationIntent: () => ({ status: "missing" }),
+  };
+  const post = createPost({
+    routes: {
+      team: definePostRoute({
+        addressKind: "team",
+        address,
+        event,
+        deadlineMs: 1_000,
+        name: (to) => to.teamId,
+        namespace: {
+          getByName: () => ({
+            deliver: () => {
+              now = 1_101;
+              return Promise.reject(new Error("offline"));
+            },
+          }),
+        },
+      }),
+    },
+    owner,
+    transactional,
+    readJob: (id) => settledJob(jobs, id),
+    now: () => now,
+    scheduleWake: () => Promise.resolve(),
+  });
+  post.send({
+    key: "crossed-deadline",
+    kind: "team",
+    address: { teamId: "t1" },
+    event: { text: "x" },
+  });
+
+  await post.execute(running(jobs[0]));
+
+  expect(post.read("crossed-deadline")).toMatchObject({
+    state: "dead",
+    reason: "expired",
+    attempts: 1,
+    deadlineAt: 1_100,
+  });
+});
+
+it("refuses deadline routes on relational Post adapters with a typed reason", () => {
+  const route = definePostRoute({
+    addressKind: "team",
+    address,
+    event,
+    deadlineMs: 1_000,
+    name: (to) => to.teamId,
+    namespace: {
+      getByName: () => ({
+        deliver: () => Promise.resolve("accepted"),
+      }),
+    },
+  });
+
+  expect(() =>
+    openSqlPost(
+      {
+        query: () => Promise.resolve([]),
+        commit: () => Promise.resolve(),
+      },
+      {
+        routes: { team: route },
+        now: () => 100,
+        scheduleWake: () => Promise.resolve(),
+      },
+    ),
+  ).toThrow(
+    expect.objectContaining({
+      _tag: PostError.name,
+      reason: "relational-deadline-unsupported",
+    }),
+  );
 });
 
 it("times out a hung receiver, preserves its retry, and lets the next recipient run", async () => {

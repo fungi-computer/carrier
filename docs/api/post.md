@@ -12,26 +12,27 @@
 
 ### PostError
 
-Post rejected an unknown route or conflicting key.
+Post rejected an unknown route, conflicting key, or unsupported policy.
 
 #### Extends
 
 - `YieldableError`\<`this`\> & `object` & `Readonly`\<\{ `message`: `string`;
-  \}\>
+  `reason?`: `"relational-deadline-unsupported"`; \}\>
 
 #### Constructors
 
 ##### Constructor
 
 ```ts
-new PostError(message): PostError;
+new PostError(message, reason?): PostError;
 ```
 
 ###### Parameters
 
-| Parameter | Type     |
-| --------- | -------- |
-| `message` | `string` |
+| Parameter | Type                                |
+| --------- | ----------------------------------- |
+| `message` | `string`                            |
+| `reason?` | `"relational-deadline-unsupported"` |
 
 ###### Returns
 
@@ -42,10 +43,23 @@ new PostError(message): PostError;
 ```ts
 Data.TaggedError("PostError")<{
   readonly message: string;
+  readonly reason?: "relational-deadline-unsupported";
 }>.constructor
 ```
 
 #### Properties
+
+##### reason?
+
+```ts
+readonly optional reason?: "relational-deadline-unsupported";
+```
+
+###### Inherited from
+
+```ts
+Data.TaggedError("PostError").reason;
+```
 
 ##### message
 
@@ -159,6 +173,7 @@ Pending row, terminal receipt, or dead letter.
 ```ts
 type PostRoute<A, E, D, AI, EI, DI> = Readonly<{
   addressKind: string;
+  deadlineMs?: number;
   address: Schema.Codec<A, AI>;
   event: Schema.Codec<E, EI>;
   name: (address) => string;
@@ -205,6 +220,7 @@ Schema-correlated ordinary events or prepared delivery facts.
 ```ts
 type PostRegistryRoute = Readonly<{
   addressKind: string;
+  deadlineMs?: number;
   address: Schema.Codec<unknown, unknown>;
   event: Schema.Codec<unknown, unknown>;
   encodeEnvelope: (envelope) => PostEnvelope;
@@ -233,13 +249,14 @@ type PostRuntime<R> = Readonly<{
     }>
   >;
   enqueueDue: (limit?, afterKey?) => Promise<string | undefined>;
+  releaseNow: (limit?, afterKey?) => Promise<string | undefined>;
   deadLetters: (
     limit?,
     afterKey?,
   ) => Readonly<{
     letters: readonly Readonly<{
       key: string;
-      reason: "refused" | "exhausted";
+      reason: "refused" | "exhausted" | "expired";
       envelope: PostEnvelope;
       attempts: number;
     }>[];
@@ -323,6 +340,7 @@ const PostRowSchema: fromJsonString<
         }>;
         attempts: Int;
         nextAttemptAt: Number;
+        deadlineAt: optional<Number>;
         jobId: optional<String>;
         delivery: optional<
           Struct<{
@@ -348,7 +366,8 @@ const PostRowSchema: fromJsonString<
           event: Unknown;
         }>;
         attempts: Int;
-        reason: Literals<readonly ["refused", "exhausted"]>;
+        reason: Literals<readonly ["refused", "exhausted", "expired"]>;
+        deadlineAt: optional<Number>;
         receipt: optional<Codec<Json, Json, never, never>>;
         delivery: optional<
           Struct<{
@@ -432,6 +451,7 @@ may let their owner rest.
 ```ts
 function definePostRoute<A, E, AI, EI>(route): PostRoute<A, E, E, AI, EI, EI> & Omit<Readonly<{
   addressKind: string;
+  deadlineMs?: number;
   address: Codec<unknown, unknown>;
   event: Codec<unknown, unknown>;
   encodeEnvelope: (envelope) => object;
@@ -467,29 +487,30 @@ Preserve each route's inferred address and event types in a registry.
 
 ##### Parameters
 
-| Parameter | Type                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `route`   | `Readonly`\<\{ `addressKind`: `string`; `address`: `Codec`\<`A`, `AI`\>; `event`: `Codec`\<`E`, `EI`\>; `name`: (`address`) => `string`; `namespace`: `Readonly`\<\{ `getByName`: (`name`) => `Readonly`\<\{ `deliver`: (`envelope`) => `Promise`\<[`PostDeliveryResult`](#postdeliveryresult)\>; \}\>; \}\>; \}\> & `Readonly`\<\{ `prepare?`: `undefined`; `onDelivered?`: (`address`, `event`) => `void`; `onCursor?`: (`address`, `event`, `cursor`) => `void`; `onRefused?`: (`address`, `event`) => `void`; \}\> |
+| Parameter | Type                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `route`   | `Readonly`\<\{ `addressKind`: `string`; `deadlineMs?`: `number`; `address`: `Codec`\<`A`, `AI`\>; `event`: `Codec`\<`E`, `EI`\>; `name`: (`address`) => `string`; `namespace`: `Readonly`\<\{ `getByName`: (`name`) => `Readonly`\<\{ `deliver`: (`envelope`) => `Promise`\<[`PostDeliveryResult`](#postdeliveryresult)\>; \}\>; \}\>; \}\> & `Readonly`\<\{ `prepare?`: `undefined`; `onDelivered?`: (`address`, `event`) => `void`; `onCursor?`: (`address`, `event`, `cursor`) => `void`; `onRefused?`: (`address`, `event`) => `void`; \}\> |
 
 ##### Returns
 
 [`PostRoute`](#postroute)\<`A`, `E`, `E`, `AI`, `EI`, `EI`\> &
-`Omit`\<`Readonly`\<\{ `addressKind`: `string`; `address`: `Codec`\<`unknown`,
-`unknown`\>; `event`: `Codec`\<`unknown`, `unknown`\>; `encodeEnvelope`:
-(`envelope`) => `object`; `parseDelivery`: (`envelope`) => `object`;
-`prepareEnvelope?`: (`envelope`, `signal`) => `Promise`\<\{ `key`: `string`;
-`kind`: `string`; `address`: `unknown`; `event`: `unknown`; \}\>;
-`recordDelivered?`: (`envelope`) => `void`; `nameOf`: (`envelope`) => `string`;
-`namespace`: `Readonly`\<\{ `getByName`: (`name`) => `Readonly`\<\{ `deliver`:
-(`envelope`) => `Promise`\<...\>; \}\>; \}\>; `recordCursor?`: (`envelope`,
-`cursor`) => `void`; `recordRefused?`: (`envelope`) => `void`; \}\>, `"address"`
-\| `"event"`\>
+`Omit`\<`Readonly`\<\{ `addressKind`: `string`; `deadlineMs?`: `number`;
+`address`: `Codec`\<`unknown`, `unknown`\>; `event`: `Codec`\<`unknown`,
+`unknown`\>; `encodeEnvelope`: (`envelope`) => `object`; `parseDelivery`:
+(`envelope`) => `object`; `prepareEnvelope?`: (`envelope`, `signal`) =>
+`Promise`\<\{ `key`: `string`; `kind`: `string`; `address`: `unknown`; `event`:
+`unknown`; \}\>; `recordDelivered?`: (`envelope`) => `void`; `nameOf`:
+(`envelope`) => `string`; `namespace`: `Readonly`\<\{ `getByName`: (`name`) =>
+`Readonly`\<\{ `deliver`: (`envelope`) => `Promise`\<...\>; \}\>; \}\>;
+`recordCursor?`: (`envelope`, `cursor`) => `void`; `recordRefused?`:
+(`envelope`) => `void`; \}\>, `"address"` \| `"event"`\>
 
 #### Call Signature
 
 ```ts
 function definePostRoute<A, E, D, AI, EI, DI>(route): PostRoute<A, E, D, AI, EI, DI> & Omit<Readonly<{
   addressKind: string;
+  deadlineMs?: number;
   address: Codec<unknown, unknown>;
   event: Codec<unknown, unknown>;
   encodeEnvelope: (envelope) => object;
@@ -527,23 +548,23 @@ Preserve each route's inferred address and event types in a registry.
 
 ##### Parameters
 
-| Parameter | Type                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `route`   | `Readonly`\<\{ `addressKind`: `string`; `address`: `Codec`\<`A`, `AI`\>; `event`: `Codec`\<`E`, `EI`\>; `name`: (`address`) => `string`; `namespace`: `Readonly`\<\{ `getByName`: (`name`) => `Readonly`\<\{ `deliver`: (`envelope`) => `Promise`\<[`PostDeliveryResult`](#postdeliveryresult)\>; \}\>; \}\>; \}\> & `Readonly`\<\{ `prepare`: `Readonly`\<\{ `event`: `Schema.Codec`\<`D`, `DI`\>; `run`: (`address`, `intent`, `signal`) => `Promise`\<`D`\>; \}\>; `onDelivered?`: (`address`, `event`) => `void`; `onCursor?`: (`address`, `event`, `cursor`) => `void`; `onRefused?`: (`address`, `event`) => `void`; \}\> |
+| Parameter | Type                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `route`   | `Readonly`\<\{ `addressKind`: `string`; `deadlineMs?`: `number`; `address`: `Codec`\<`A`, `AI`\>; `event`: `Codec`\<`E`, `EI`\>; `name`: (`address`) => `string`; `namespace`: `Readonly`\<\{ `getByName`: (`name`) => `Readonly`\<\{ `deliver`: (`envelope`) => `Promise`\<[`PostDeliveryResult`](#postdeliveryresult)\>; \}\>; \}\>; \}\> & `Readonly`\<\{ `prepare`: `Readonly`\<\{ `event`: `Schema.Codec`\<`D`, `DI`\>; `run`: (`address`, `intent`, `signal`) => `Promise`\<`D`\>; \}\>; `onDelivered?`: (`address`, `event`) => `void`; `onCursor?`: (`address`, `event`, `cursor`) => `void`; `onRefused?`: (`address`, `event`) => `void`; \}\> |
 
 ##### Returns
 
 [`PostRoute`](#postroute)\<`A`, `E`, `D`, `AI`, `EI`, `DI`\> &
-`Omit`\<`Readonly`\<\{ `addressKind`: `string`; `address`: `Codec`\<`unknown`,
-`unknown`\>; `event`: `Codec`\<`unknown`, `unknown`\>; `encodeEnvelope`:
-(`envelope`) => `object`; `parseDelivery`: (`envelope`) => `object`;
-`prepareEnvelope?`: (`envelope`, `signal`) => `Promise`\<\{ `key`: `string`;
-`kind`: `string`; `address`: `unknown`; `event`: `unknown`; \}\>;
-`recordDelivered?`: (`envelope`) => `void`; `nameOf`: (`envelope`) => `string`;
-`namespace`: `Readonly`\<\{ `getByName`: (`name`) => `Readonly`\<\{ `deliver`:
-(`envelope`) => `Promise`\<...\>; \}\>; \}\>; `recordCursor?`: (`envelope`,
-`cursor`) => `void`; `recordRefused?`: (`envelope`) => `void`; \}\>, `"address"`
-\| `"event"`\>
+`Omit`\<`Readonly`\<\{ `addressKind`: `string`; `deadlineMs?`: `number`;
+`address`: `Codec`\<`unknown`, `unknown`\>; `event`: `Codec`\<`unknown`,
+`unknown`\>; `encodeEnvelope`: (`envelope`) => `object`; `parseDelivery`:
+(`envelope`) => `object`; `prepareEnvelope?`: (`envelope`, `signal`) =>
+`Promise`\<\{ `key`: `string`; `kind`: `string`; `address`: `unknown`; `event`:
+`unknown`; \}\>; `recordDelivered?`: (`envelope`) => `void`; `nameOf`:
+(`envelope`) => `string`; `namespace`: `Readonly`\<\{ `getByName`: (`name`) =>
+`Readonly`\<\{ `deliver`: (`envelope`) => `Promise`\<...\>; \}\>; \}\>;
+`recordCursor?`: (`envelope`, `cursor`) => `void`; `recordRefused?`:
+(`envelope`) => `void`; \}\>, `"address"` \| `"event"`\>
 
 ---
 
@@ -557,9 +578,9 @@ Decode at both persisted and DO boundaries with the route's Effect Schema.
 
 #### Type Parameters
 
-| Type Parameter                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `R` _extends_ `Record`\<`string`, `Readonly`\<\{ `addressKind`: `string`; `address`: `Codec`\<`unknown`, `unknown`\>; `event`: `Codec`\<`unknown`, `unknown`\>; `encodeEnvelope`: (`envelope`) => `object`; `parseDelivery`: (`envelope`) => `object`; `prepareEnvelope?`: (`envelope`, `signal`) => `Promise`\<\{ `key`: `string`; `kind`: `string`; `address`: `unknown`; `event`: `unknown`; \}\>; `recordDelivered?`: (`envelope`) => `void`; `nameOf`: (`envelope`) => `string`; `namespace`: `Readonly`\<\{ `getByName`: (`name`) => `Readonly`\<\{ `deliver`: (`envelope`) => `Promise`\<[`PostDeliveryResult`](#postdeliveryresult)\>; \}\>; \}\>; `recordCursor?`: (`envelope`, `cursor`) => `void`; `recordRefused?`: (`envelope`) => `void`; \}\>\> |
+| Type Parameter                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `R` _extends_ `Record`\<`string`, `Readonly`\<\{ `addressKind`: `string`; `deadlineMs?`: `number`; `address`: `Codec`\<`unknown`, `unknown`\>; `event`: `Codec`\<`unknown`, `unknown`\>; `encodeEnvelope`: (`envelope`) => `object`; `parseDelivery`: (`envelope`) => `object`; `prepareEnvelope?`: (`envelope`, `signal`) => `Promise`\<\{ `key`: `string`; `kind`: `string`; `address`: `unknown`; `event`: `unknown`; \}\>; `recordDelivered?`: (`envelope`) => `void`; `nameOf`: (`envelope`) => `string`; `namespace`: `Readonly`\<\{ `getByName`: (`name`) => `Readonly`\<\{ `deliver`: (`envelope`) => `Promise`\<[`PostDeliveryResult`](#postdeliveryresult)\>; \}\>; \}\>; `recordCursor?`: (`envelope`, `cursor`) => `void`; `recordRefused?`: (`envelope`) => `void`; \}\>\> |
 
 #### Parameters
 

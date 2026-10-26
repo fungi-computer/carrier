@@ -157,7 +157,7 @@ const PostReceiptSummarySchema: Union<
       state: Literal<"dead">;
       kind: String;
       attempts: Int;
-      reason: Literals<readonly ["refused", "exhausted"]>;
+      reason: Literals<readonly ["refused", "exhausted", "expired"]>;
     }>,
   ]
 >;
@@ -188,7 +188,7 @@ const PostInspectionPageSchema: Union<readonly [Struct<{
      state: Literal<"dead">;
      kind: String;
      attempts: Int;
-     reason: Literals<readonly [..., ...]>;
+     reason: Literals<readonly [..., ..., ...]>;
   }>]>>;
   nextCursor: NullOr<String>;
 }>]>;
@@ -275,7 +275,7 @@ jobs or arming a wake. The trusted host must admit an operator before calling.
 
 #### Returns
 
-| Name      | Type                                                                                                                                                                                                                                                                                                                                                                                                                                               | Description                                                                        |
-| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| `email()` | (`input`) => \| \{ `status`: `"uninitialized"`; \} \| \{ `status`: `"available"`; `records`: readonly `object`[]; `nextCursor`: `string` \| `null`; \}                                                                                                                                                                                                                                                                                             | Read aggregate dispatch evidence without email cargo or recipient addresses.       |
-| `post()`  | (`input`) => \| \{ `status`: `"uninitialized"`; \} \| \{ `status`: `"available"`; `records`: readonly ( \| \{ `key`: `string`; `state`: `"delivered"`; \} \| \{ `key`: `string`; `state`: `"pending"`; `kind`: `string`; `attempts`: `number`; `nextAttemptAt`: `number`; \} \| \{ `key`: `string`; `state`: `"dead"`; `kind`: `string`; `attempts`: `number`; `reason`: `"refused"` \| `"exhausted"`; \})[]; `nextCursor`: `string` \| `null`; \} | Read Post metadata; filtered pages retain their continuation through other states. |
+| Name      | Type                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Description                                                                        |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `email()` | (`input`) => \| \{ `status`: `"uninitialized"`; \} \| \{ `status`: `"available"`; `records`: readonly `object`[]; `nextCursor`: `string` \| `null`; \}                                                                                                                                                                                                                                                                                                            | Read aggregate dispatch evidence without email cargo or recipient addresses.       |
+| `post()`  | (`input`) => \| \{ `status`: `"uninitialized"`; \} \| \{ `status`: `"available"`; `records`: readonly ( \| \{ `key`: `string`; `state`: `"delivered"`; \} \| \{ `key`: `string`; `state`: `"pending"`; `kind`: `string`; `attempts`: `number`; `nextAttemptAt`: `number`; \} \| \{ `key`: `string`; `state`: `"dead"`; `kind`: `string`; `attempts`: `number`; `reason`: `"expired"` \| `"refused"` \| `"exhausted"`; \})[]; `nextCursor`: `string` \| `null`; \} | Read Post metadata; filtered pages retain their continuation through other states. |

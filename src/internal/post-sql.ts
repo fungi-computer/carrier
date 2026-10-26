@@ -59,7 +59,7 @@ const pageSize = Schema.Int.check(
 /** SQL native Carrier runtime configuration; route decisions remain in Post. */
 export type SqlPostOptions<R extends Record<string, PostRegistryRoute>> =
   Readonly<{
-    /** The same address/event registry used by SQLite Post. */
+    /** The same registry used by SQLite Post; routes with deadlines are rejected. */
     routes: R;
     /** Optional bounded, redacted family diagnostic; never persist raw provider errors. */
     failureDetail?: (cause: unknown) => string;
@@ -206,6 +206,15 @@ export function openSqlPost<R extends Record<string, PostRegistryRoute>>(
   database: PostSql,
   options: SqlPostOptions<R>,
 ): SqlPostRuntime {
+  if (
+    Object.values(options.routes).some(
+      (route) => route.deadlineMs !== undefined,
+    )
+  )
+    throw new PostError(
+      "relational Post adapters do not support route deadlines",
+      "relational-deadline-unsupported",
+    );
   const policy = Schema.decodeUnknownSync(
     Schema.Struct({
       maxAttempts: Schema.Int.check(
