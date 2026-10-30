@@ -107,7 +107,7 @@
           {
             "title": "Install",
             "href": "/install/",
-            "description": "Entrypoints, peer packages and the databases each adapter needs."
+            "description": "Entrypoints, runtime dependencies and the databases each adapter needs."
           },
           {
             "title": "Status and limits",
