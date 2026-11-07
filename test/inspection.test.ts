@@ -1,3 +1,4 @@
+import type { WatchdogRuntime } from "@fungi.computer/watchdog";
 import { afterEach, expect, it } from "vitest";
 import * as Schema from "effect/Schema";
 import { createPost, definePostRoute } from "../src/post.js";
@@ -5,7 +6,7 @@ import {
   createDeliveryInspection,
   DeliveryInspectionError,
 } from "../src/inspection.js";
-import type { WatchdogQueuedJob } from "@fungi.computer/watchdog";
+import { Watchdog } from "@fungi.computer/watchdog";
 import { createCarrier } from "../src/index.js";
 import { createSqliteOwnerFixture } from "../../watchdog/test/sqlite-owner.fixture.js";
 
@@ -17,10 +18,21 @@ afterEach(() => {
 it("reads retained Post evidence as bounded metadata without dispatching", async () => {
   const fixture = createSqliteOwnerFixture();
   fixtures.push(fixture);
-  const jobs: WatchdogQueuedJob[] = [];
   let deliveries = 0;
   let wakes = 0;
   let refused = false;
+  const watchdog: WatchdogRuntime = await Watchdog.make({
+    owner: fixture.owner,
+    isAlive: () => Promise.resolve(false),
+    retryPolicy: (job) => post.retryPolicy(job),
+    execute: (job, signal, attempt) => post.execute(job, attempt, signal),
+    wake: {
+      recompute: () => {
+        wakes++;
+        return Promise.resolve();
+      },
+    },
+  });
   const post = createPost({
     owner: fixture.owner,
     routes: {
@@ -41,13 +53,7 @@ it("reads retained Post evidence as bounded metadata without dispatching", async
         },
       }),
     },
-    transactional: {
-      enqueueAcceptedJob: (job) => jobs.push(job),
-      readQueueHead: () => ({ state: "idle" }),
-      readLatestSettledJob: () => undefined,
-      recordCancellationIntent: () => ({ status: "missing" }),
-    },
-    readJob: () => Promise.resolve({ status: "missing" }),
+    transactional: watchdog.transactional,
     now: () => 100,
     scheduleWake: () => {
       wakes += 1;
@@ -66,9 +72,7 @@ it("reads retained Post evidence as bounded metadata without dispatching", async
     address: { name: "two" },
     event: { secret: "private event" },
   });
-  const job = jobs[0];
-  if (job === undefined) throw new Error("Post did not queue the delivery");
-  await post.execute({ ...job, state: "running" });
+  await watchdog.tick();
 
   // A fresh reader has no sender, Watchdog runtime or wake capability.
   const inspection = createDeliveryInspection(fixture.owner.sql);
@@ -85,7 +89,7 @@ it("reads retained Post evidence as bounded metadata without dispatching", async
         state: "pending",
         kind: "destination",
         attempts: 0,
-        nextAttemptAt: 100,
+        nextAttemptAt: 0,
       },
     ],
     nextCursor: "b",
@@ -97,7 +101,10 @@ it("reads retained Post evidence as bounded metadata without dispatching", async
   });
   expect(deliveries).toBe(1);
   expect(wakes).toBe(1);
-  expect(jobs).toHaveLength(2);
+  expect(
+    fixture.owner.sql.exec("SELECT job_id FROM watchdog_jobs").toArray(),
+  ).toHaveLength(2);
+  await watchdog.tick();
 
   refused = true;
   post.send({
@@ -106,10 +113,7 @@ it("reads retained Post evidence as bounded metadata without dispatching", async
     address: { name: "three" },
     event: { secret: "private event" },
   });
-  const refusalJob = jobs.at(-1);
-  if (refusalJob === undefined)
-    throw new Error("Post did not queue the refusal");
-  await post.execute({ ...refusalJob, state: "running" });
+  await watchdog.tick();
   expect(inspection.post({ view: "deadLetters", limit: 1 })).toEqual({
     status: "available",
     records: [],

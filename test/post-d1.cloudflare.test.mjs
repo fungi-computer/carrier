@@ -43,7 +43,8 @@ async function open(retry) {
     const watchdog = createD1Watchdog({
       database,
       now: () => clock.now,
-      execute: (job, signal) => post.execute(job, signal),
+      retryPolicy: (job) => post.retryPolicy(job),
+      execute: (job, signal, attempt) => post.execute(job, attempt, signal),
       wake: { recompute: () => Promise.resolve() },
     });
     const options = {
@@ -51,7 +52,6 @@ async function open(retry) {
       watchdog,
       routes,
       now: () => clock.now,
-      scheduleWake: () => Promise.resolve(),
     };
     const post = createD1Post(
       retry === undefined ? options : { ...options, retry },
@@ -143,7 +143,7 @@ it("admits a conditionally generated ledger event and its job in the producer's 
   const source = {
     text: `SELECT id AS post_key,json_object('key',id,'kind','account','address',json_object('id','a'),
     'event',json_object('text','hello')) AS envelope_json,'["account","a"]' AS queue_name,
-    1000 AS next_attempt_at,'ledger:'||id AS job_id FROM ledger WHERE id=?1 AND eligible=1`,
+    'ledger:'||id AS job_id FROM ledger WHERE id=?1 AND eligible=1`,
     values: ["conditional"],
   };
   const statements = () => [

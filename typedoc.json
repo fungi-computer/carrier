@@ -9,8 +9,7 @@
     "src/inspection.ts",
     "src/cloudflare.ts",
     "src/post-d1.ts",
-    "src/post-postgres.ts",
-    "src/testing.ts"
+    "src/post-postgres.ts"
   ],
   "tsconfig": "tsconfig.json",
   "out": "docs/api",

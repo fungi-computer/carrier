@@ -1,5 +1,19 @@
 # @fungi.computer/carrier
 
+## 0.2.2
+
+### Patch Changes
+
+- Changes since 0.2.1:
+
+  - fix(carrier): keep PostError's reason union inline and documented
+  - fix(carrier): refuse a pre-scheduler SQLite Post store
+  - fix(durability): give Watchdog delivery and timer readiness
+  - fix(durability): preserve retry decisions and drain ownership across restart
+
+- Updated dependencies
+  - @fungi.computer/watchdog@0.1.1
+
 ## 0.2.1
 
 ### Patch Changes

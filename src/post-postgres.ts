@@ -71,21 +71,6 @@ export function createPostgresPost<R extends Record<string, PostRegistryRoute>>(
             ...statement.values,
           ])
         ).rows,
-      commit: async (statements, key, jobId) => {
-        const client = await options.database.connect();
-        try {
-          await client.query("BEGIN");
-          for (const statement of statements)
-            await client.query(statement.text, [...statement.values]);
-          await enqueue(client, jobSelect(key, true, jobId));
-          await client.query("COMMIT");
-        } catch (error) {
-          await client.query("ROLLBACK");
-          throw error;
-        } finally {
-          client.release();
-        }
-      },
     },
     options,
   );

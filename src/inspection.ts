@@ -104,7 +104,12 @@ export class DeliveryInspectionError extends Error {
   }
 }
 
-const StoredPost = Schema.Struct({ key: Schema.String, value: PostRowSchema });
+const StoredPost = Schema.Struct({
+  key: Schema.String,
+  value: PostRowSchema,
+  attempt_count: Schema.NullOr(Schema.Int),
+  not_before: Schema.NullOr(Schema.Number),
+});
 const StoredEmail = Schema.Struct({
   id: Key,
   status: CarrierStatusSchema,
@@ -198,40 +203,45 @@ export function createDeliveryInspection(sql: WatchdogSqliteOwner["sql"]) {
         const rows = Schema.decodeUnknownSync(Schema.Array(StoredPost))(
           sql
             .exec(
-              "SELECT key,value FROM carrier_post_rows WHERE key LIKE 'post:%' AND key>? ORDER BY key LIMIT ?",
+              "SELECT p.key,p.value,w.attempt_count,w.not_before FROM carrier_post_rows p LEFT JOIN watchdog_jobs w ON w.job_id=json_extract(p.value,'$.jobId') WHERE p.key LIKE 'post:%' AND p.key>? ORDER BY p.key LIMIT ?",
               `post:${query.after ?? ""}`,
               query.limit,
             )
             .toArray(),
         );
-        const records = rows.flatMap<PostReceiptSummary>(({ key, value }) => {
-          if (query.view === "deadLetters" && value.state !== "dead") return [];
-          const receiptKey = key.slice("post:".length);
-          switch (value.state) {
-            case "delivered":
-              return [{ key: receiptKey, state: value.state }];
-            case "pending":
-              return [
-                {
-                  key: receiptKey,
-                  state: value.state,
-                  kind: value.envelope.kind,
-                  attempts: value.attempts,
-                  nextAttemptAt: value.nextAttemptAt,
-                },
-              ];
-            case "dead":
-              return [
-                {
-                  key: receiptKey,
-                  state: value.state,
-                  kind: value.envelope.kind,
-                  attempts: value.attempts,
-                  reason: value.reason,
-                },
-              ];
-          }
-        });
+        const records = rows.flatMap<PostReceiptSummary>(
+          ({ key, value, attempt_count, not_before }) => {
+            if (query.view === "deadLetters" && value.state !== "dead")
+              return [];
+            const receiptKey = key.slice("post:".length);
+            switch (value.state) {
+              case "delivered":
+                return [{ key: receiptKey, state: value.state }];
+              case "pending":
+                if (attempt_count === null || not_before === null)
+                  throw new DeliveryInspectionError("unavailable");
+                return [
+                  {
+                    key: receiptKey,
+                    state: value.state,
+                    kind: value.envelope.kind,
+                    attempts: attempt_count,
+                    nextAttemptAt: not_before,
+                  },
+                ];
+              case "dead":
+                return [
+                  {
+                    key: receiptKey,
+                    state: value.state,
+                    kind: value.envelope.kind,
+                    attempts: value.attempts,
+                    reason: value.reason,
+                  },
+                ];
+            }
+          },
+        );
         return Schema.decodeUnknownSync(PostInspectionPageSchema)({
           status: "available",
           records,

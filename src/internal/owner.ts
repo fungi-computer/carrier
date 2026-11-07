@@ -543,7 +543,9 @@ export function openOwner(options: Options) {
       );
       return (
         domainPending ||
-        (yield* watchdog.hasPendingWork.pipe(Effect.mapError(unavailable)))
+        (yield* watchdog
+          .wakeState(options.now())
+          .pipe(Effect.mapError(unavailable))).pending
       );
     }),
   };

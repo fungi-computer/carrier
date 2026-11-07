@@ -63,9 +63,9 @@ PostError.
 
 #### Parameters
 
-| Parameter | Type                                                                                                                                                                                                                                                                                                                                                                     |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `options` | `Readonly`\<\{ `routes`: `R`; `failureDetail?`: (`cause`) => `string`; `retry?`: `Readonly`\<\{ `maxAttempts`: `number`; `baseDelayMs`: `number`; `maxDelayMs`: `number`; \}\>; `now`: () => `number`; `scheduleWake`: (`at`) => `Promise`\<`void`\>; \}\> & `Readonly`\<\{ `database`: `Pick`\<`Pool`, `"query"` \| `"connect"`\>; `watchdog`: `PostgresWatchdog`; \}\> |
+| Parameter | Type                                                                                                                                                                                                                                                                                                                      |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `options` | `Readonly`\<\{ `routes`: `R`; `failureDetail?`: (`cause`) => `string`; `retry?`: `Readonly`\<\{ `maxAttempts`: `number`; `baseDelayMs`: `number`; `maxDelayMs`: `number`; \}\>; `now`: () => `number`; \}\> & `Readonly`\<\{ `database`: `Pick`\<`Pool`, `"query"` \| `"connect"`\>; `watchdog`: `PostgresWatchdog`; \}\> |
 
 #### Returns
 

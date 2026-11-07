@@ -26,12 +26,15 @@ export const PostDeliveryResultSchema = Schema.Union([
   }),
 ]);
 
-/** Post rejected an unknown route, conflicting key, or unsupported policy. */
+/** Post rejected an unknown route, conflicting key, unsupported policy or store. */
 export class PostError extends Data.TaggedError("PostError")<{
   readonly message: string;
-  readonly reason?: "relational-deadline-unsupported";
+  readonly reason?: "relational-deadline-unsupported" | "pre-scheduler-store";
 }> {
-  constructor(message: string, reason?: "relational-deadline-unsupported") {
+  constructor(
+    message: string,
+    reason?: "relational-deadline-unsupported" | "pre-scheduler-store",
+  ) {
     super(reason === undefined ? { message } : { message, reason });
   }
 }

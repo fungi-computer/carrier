@@ -92,23 +92,6 @@ from the Durable Object alarm.
 
 In a Durable Object, `ctx.storage` is already the SQLite owner.
 
-### Memory outbox for tests
-
-`createMemoryOutbox()` stores encoded string rows in process memory for tests
-and quick starts. It provides `put`, `read`, key-ordered `list(limit, afterKey)`
-and `delete`. Each instance is independent; it is not durable storage. BirdDog’s
-[quick start](https://docs.fungi.computer/bird-dog/quickstart/) uses this
-helper.
-
-```ts
-import { createMemoryOutbox } from "@fungi.computer/carrier/testing";
-
-const outbox = createMemoryOutbox();
-await outbox.put("mail:one", "encoded mail");
-console.log(await outbox.list(1));
-// [{ key: "mail:one", value: "encoded mail" }]
-```
-
 ## Core concepts
 
 **Emails and Messages.** One Email has shared content and an envelope: `from`,
@@ -212,15 +195,18 @@ dead-letter reason. They omit Post addresses and events, email bodies, headers
 and recipient addresses. Delivered Post rows keep only their key and state.
 Email `attempts` counts definite provider rejections, so an accepted or
 ambiguous first dispatch has zero. Post `attempts` counts receiver invocations.
+Carrier's stored Post `attempts` is receipt-only evidence after a terminal
+outcome. While delivery is pending, Watchdog's `attempt_count` is authoritative;
+pending inspection reads that count from Watchdog.
 
 ## Post
 
-Post's ordinary retry policy uses Almanac's shared pure backoff calculation: 2
-seconds initially, doubling to a 5-minute cap, with at most 20 receiver
-attempts. The synchronous and SQL adapters share that default policy; explicit
-SQL retry policies retain their own delays. A SQLite route with `deadlineMs`
-uses its finite lifetime instead of the attempt ceiling. Almanac supplies
-arithmetic only, not a second scheduler or retry owner.
+Watchdog applies Post's ordinary retry policy using Almanac's backoff
+calculation: 2 seconds initially, doubling to a 5-minute cap, with at most 20
+receiver attempts. The synchronous and SQL adapters share that default policy;
+explicit SQL retry policies retain their own delays. A SQLite route with
+`deadlineMs` uses its finite lifetime instead of the attempt ceiling. Almanac
+supplies arithmetic only, not a second scheduler or retry owner.
 
 `@fungi.computer/carrier/post` delivers typed, point-to-point envelopes between
 named Durable Objects. `definePostRoute` pairs each address schema and event
@@ -237,29 +223,27 @@ admission receipt commit together. Keys must identify the producing event across
 all senders to that receiver.
 
 Construct `createPost` with the producer's structural SQLite `owner`, typed
-`routes`, Watchdog's `transactional` projection and `readJob` operation, a
-clock, and a durable `scheduleWake`. Post owns its tables. Call `send` inside
-the same transaction as the producer's state change and durable initial wake. It
-commits the envelope and Watchdog delivery work together. Each producer's events
-reach a named address in order. A pending predecessor holds its successor until
-it is delivered or dead. Replaying the same stable key keeps the existing work
-or its completion receipt. Keep those receipts while the source can replay.
+`routes`, Watchdog's `transactional` projection, a clock, and a durable
+`scheduleWake`. Post owns its tables. Call `send` inside the same transaction as
+the producer's state change and durable initial wake. It commits the envelope
+and Watchdog delivery work together. Each producer's events reach a named
+address in order. A pending predecessor holds its successor until it is
+delivered or dead. Replaying the same stable key keeps the existing work or its
+completion receipt. Keep those receipts while the source can replay.
 
-Use `execute` as the Watchdog executor for Post jobs. It records an attempt and
-arms recovery before calling the addressed Durable Object. After the owner ticks
-Watchdog, call `enqueueDue` at a wake to inspect settled jobs and enqueue due
-retries, then tick Watchdog for the newly queued work. Continue its bounded
-pages with the returned cursor. Queued or running jobs stay with Watchdog's
-lifecycle. A missing job or row is an error. After a lost response or failed
-receipt write, a retry carries the same envelope key and the receiver reports
-`duplicate`.
+Wire Watchdog's `retryPolicy` to `post.retryPolicy` and its executor as
+`(job, signal, attempt) => post.execute(job, attempt, signal)`. Watchdog
+reserves the attempt and fallback deadline before receiver I/O. A retry retains
+the same job and envelope key; `wakeState(now)` reports readiness and the next
+deadline. Delivery recovery never borrows the Agent crash budget. A receiver
+must admit repeated keys idempotently after a lost response or receipt write.
 
 `latest(kind, address)` reads the newest staged event or its receipt for that
 recipient without scanning other recipients. A member or operator command can
 call `retry(key)` inside the producer's transaction with its awaited wake. It
-expedites a settled failed attempt or puts a dead letter after current queued
-work, keeping its prepared fact. Queued and running jobs stay with Watchdog, and
-a delivered receipt is never reopened.
+expedites a queued retry without resetting its attempt count, or gives a dead
+letter new work after the current queue while keeping its prepared fact. Queued
+and running jobs stay with Watchdog, and a delivered receipt is never reopened.
 
 A route can prepare a wire fact from its staged intent with
 `prepare: { event: wireSchema, run(address, intent, signal) }`. Preparation and
@@ -276,45 +260,36 @@ dead-letter envelope, its reason and its attempt count. `deadLetters` returns
 `letters` and `nextCursor`, including a continuation through pages that contain
 only receipts.
 
-The same retry and receipt machinery is exported as `makePostOutbox` for a
-string-backed outbox. [BirdDog](../bird-dog/README.md) uses it for agent reply
-delivery. `postOutboxPending` reports whether such an outbox still owes any
-message a delivery attempt; receipts and exhausted dead letters owe nothing. Its
-`nextWakeAt()` reads the earliest owed delivery across the retained rows,
-including future retries. Delivered receipts, exhausted dead letters and
-malformed rows do not request a wake.
-
 ## Post transactions on D1 and PostgreSQL
 
 `@fungi.computer/carrier/post-d1` and `/post-postgres` bind the ordinary Post
 address and event registry to Watchdog's database adapters. These relational
-adapters preserve their existing schema and retry contract and do not support
-route deadlines. Constructing either adapter with a route that sets `deadlineMs`
-throws `PostError` with `reason: "relational-deadline-unsupported"` before
-database access. Use SQLite-backed Post for deadline routes. Apply
-`postD1Schema` or `postPostgresSchema` alongside the matching Watchdog schema
-through your migration tool.
+adapters use the same Watchdog attempt owner and do not support route deadlines.
+Constructing either adapter with a route that sets `deadlineMs` throws
+`PostError` with `reason: "relational-deadline-unsupported"` before database
+access. Use SQLite-backed Post for deadline routes. Apply `postD1Schema` or
+`postPostgresSchema` alongside the matching Watchdog schema through your
+migration tool.
 
 On D1, `post.send(envelope)` returns the envelope and job statements. Include
 both in the same `database.batch` as the producer fact. `sendFromSelect` accepts
 a trusted native SQLite `?NNN`-bound SELECT yielding `post_key`,
-`envelope_json`, `queue_name`, `next_attempt_at` and `job_id`, for conditional
-source facts created inside that batch. PostgreSQL `post.send(client, envelope)`
-writes both rows on the producer's existing transaction client. Neither send API
-commits for the producer. A conflicting replay rolls the whole transaction back.
+`envelope_json`, `queue_name` and `job_id`, for conditional source facts created
+inside that batch. PostgreSQL `post.send(client, envelope)` writes both rows on
+the producer's existing transaction client. Neither send API commits for the
+producer. A conflicting replay rolls the whole transaction back.
 
-Wire Watchdog's executor as `(job, signal) => post.execute(job, signal)`.
-`enqueueDue` recovers a bounded page of settled delivery attempts, and the host
-keeps its durable cron or wake. Preparation, bounded receiver calls, response
-parsing and settlement decisions are shared with SQLite Post. Receipts suppress
-source replay, failed attempts retry with the same Post policy, permanent
-refusal or exhaustion becomes a dead letter, and earlier pending mail blocks
-later mail to the same address. A receiver can return `{ status, receipt }` with
-JSON receipt metadata. Post persists it with terminal settlement and exposes it
-on the delivered receipt or dead letter. That is how an email producer can
-record provider acceptance while minting credentials only during delivery. These
-async adapters reject synchronous SQLite receipt hooks rather than run them
-outside a transaction.
+Wire the same `retryPolicy` and three-argument executor as native SQLite Post.
+The host retains its durable cron or wake and ticks Watchdog directly.
+Preparation, bounded receiver calls, response parsing and settlement decisions
+are shared with SQLite Post. Receipts suppress source replay, failed attempts
+retry with the same Post policy, permanent refusal or exhaustion becomes a dead
+letter, and earlier pending mail blocks later mail to the same address. A
+receiver can return `{ status, receipt }` with JSON receipt metadata. Post
+persists it with terminal settlement and exposes it on the delivered receipt or
+dead letter. That is how an email producer can record provider acceptance while
+minting credentials only during delivery. These async adapters reject
+synchronous SQLite receipt hooks rather than run them outside a transaction.
 
 `purgeD1Post` and `purgePostgresPost` return parameterized statements selected
 by trusted producer SQL yielding `queue_name`. Compose all of them in the same

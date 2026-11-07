@@ -124,7 +124,8 @@ const openFixture = async (retry?: SqlPostRetry): Promise<Fixture> => {
     const watchdog = createPostgresWatchdog({
       database,
       now: () => clock.now,
-      execute: (job, signal) => post.execute(job, signal),
+      retryPolicy: (job) => post.retryPolicy(job),
+      execute: (job, signal, attempt) => post.execute(job, attempt, signal),
       wake: { recompute: () => Promise.resolve() },
     });
     const options = {
@@ -132,7 +133,6 @@ const openFixture = async (retry?: SqlPostRetry): Promise<Fixture> => {
       watchdog,
       routes,
       now: () => clock.now,
-      scheduleWake: () => Promise.resolve(),
     };
     const post = createPostgresPost(
       retry === undefined ? options : { ...options, retry },
@@ -237,7 +237,7 @@ const openFixture = async (retry?: SqlPostRetry): Promise<Fixture> => {
 };
 sqlPostLaws(openFixture);
 
-it("serializes erasure with a retry that has updated its envelope but not inserted its job", async () => {
+it("serializes erasure with requeue of the same charged job", async () => {
   const f = await openFixture();
   if (pool === undefined) throw new Error("Postgres fixture was not started");
   const database = pool;
@@ -248,23 +248,19 @@ it("serializes erasure with a retry that has updated its envelope but not insert
     event: { text: "hello" },
   });
   f.receiver.run = () => Promise.reject(new Error("retry"));
-  await f.watchdog.tick();
-  const pending = await f.post.read("racing");
-  if (pending?.state !== "pending") throw new Error("Expected retry");
-  f.clock.now = pending.nextAttemptAt + 1;
   const barrier = await database.connect();
   await barrier.query("SELECT pg_advisory_lock(918237)");
   await database.query(`CREATE OR REPLACE FUNCTION hold_post_retry() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN PERFORM pg_advisory_xact_lock(918237); RETURN NEW; END; $$;
-    CREATE TRIGGER hold_post_retry BEFORE INSERT ON watchdog_jobs FOR EACH ROW EXECUTE FUNCTION hold_post_retry()`);
-  const retry = f.post.enqueueDue();
+    CREATE TRIGGER hold_post_retry BEFORE UPDATE ON watchdog_jobs FOR EACH ROW WHEN (OLD.state='running' AND NEW.state='queued') EXECUTE FUNCTION hold_post_retry()`);
+  const retry = f.watchdog.tick();
   let erasure: Promise<void> | undefined;
   try {
-    // The real INSERT waits after Post has locked and updated the envelope.
+    // Watchdog retains the charged row lock while its retry update waits.
     await vi.waitFor(
       async () => {
         const waiting = await database.query(
-          "SELECT pid FROM pg_stat_activity WHERE wait_event='advisory' AND query LIKE 'INSERT INTO watchdog_jobs%'",
+          "SELECT pid FROM pg_stat_activity WHERE wait_event='advisory' AND query LIKE 'UPDATE watchdog_jobs%'",
         );
         expect(waiting.rowCount).toBe(1);
       },
@@ -274,7 +270,7 @@ it("serializes erasure with a retry that has updated its envelope but not insert
     await vi.waitFor(
       async () => {
         const waiting = await database.query(
-          "SELECT pid FROM pg_stat_activity WHERE wait_event='transactionid' AND query LIKE 'UPDATE carrier_post_rows SET post_key=post_key%'",
+          "SELECT pid FROM pg_stat_activity WHERE wait_event='transactionid' AND query LIKE 'DELETE FROM watchdog_jobs%'",
         );
         expect(waiting.rowCount).toBe(1);
       },

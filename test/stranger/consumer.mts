@@ -1,7 +1,3 @@
-import {
-  createMemoryOutbox,
-  type MemoryOutbox,
-} from "@fungi.computer/carrier/testing";
 import { createD1Post } from "@fungi.computer/carrier/post-d1";
 import { createPostgresPost } from "@fungi.computer/carrier/post-postgres";
 import {
@@ -111,9 +107,3 @@ await createCloudflareCarrier({
 await createCloudflareCarrier({ storage: nativeOptions.storage });
 
 export const nativeConstructors = { createD1Post, createPostgresPost };
-
-const memoryOutbox: MemoryOutbox = createMemoryOutbox();
-await memoryOutbox.put("typed:one", "receipt");
-const memoryRows: readonly Readonly<{ key: string; value: string }>[] =
-  await memoryOutbox.list(1);
-void memoryRows;

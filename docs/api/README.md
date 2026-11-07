@@ -17,4 +17,3 @@
 | [post-d1](post-d1.md)             | -           |
 | [post-postgres](post-postgres.md) | -           |
 | [post](post.md)                   | -           |
-| [testing](testing.md)             | -           |

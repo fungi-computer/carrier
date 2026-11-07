@@ -44,6 +44,31 @@ const envelope = (key = "one", text = "hello"): PostEnvelope => ({
 });
 
 export function sqlPostLaws(open: (retry?: SqlPostRetry) => Promise<Fixture>) {
+  it("retains the final charged delivery when its receipt crosses the receiver fence", async () => {
+    const f = await open({ maxAttempts: 1, baseDelayMs: 17, maxDelayMs: 45 });
+    try {
+      f.receiver.run = () => {
+        f.clock.now += 10_001;
+        return Promise.resolve("accepted");
+      };
+      await f.commit(envelope());
+      expect((await f.watchdog.tick()).status).toBe("requeued");
+      expect(await f.post.read("one")).toMatchObject({ state: "pending" });
+      expect(f.deliveries).toEqual(["one"]);
+      const wake = await f.watchdog.wakeState(f.clock.now);
+      expect(wake).toEqual({ pending: false, nextWakeAt: f.clock.now + 17 });
+      f.clock.now += 17;
+      expect((await f.reopen().watchdog.tick()).status).toBe("settled");
+      expect(await f.post.read("one")).toMatchObject({
+        state: "dead",
+        reason: "exhausted",
+        attempts: 1,
+      });
+      expect(f.deliveries).toEqual(["one"]);
+    } finally {
+      await f.close();
+    }
+  });
   it.each([
     {
       name: "retained default",
@@ -66,15 +91,14 @@ export function sqlPostLaws(open: (retry?: SqlPostRetry) => Promise<Fixture>) {
         await f.commit(envelope());
         for (const [index, delay] of delays.entries()) {
           const due = f.clock.now + delay;
-          await f.watchdog.tick();
-          expect(await f.post.read("one")).toMatchObject({
-            state: "pending",
-            attempts: index + 1,
-            nextAttemptAt: due,
+          await f.reopen().watchdog.tick();
+          expect(await f.post.read("one")).toMatchObject({ state: "pending" });
+          expect(await f.reopen().watchdog.wakeState(f.clock.now)).toEqual({
+            pending: false,
+            nextWakeAt: due,
           });
           if (index < delays.length - 1) {
             f.clock.now = due;
-            await f.reopen().post.enqueueDue();
           }
         }
       } finally {
@@ -112,14 +136,16 @@ export function sqlPostLaws(open: (retry?: SqlPostRetry) => Promise<Fixture>) {
       const pending = await f.post.read("owned");
       if (pending?.state !== "pending")
         throw new Error("Expected pending delivery");
-      f.clock.now = pending.nextAttemptAt + 1;
-      await f.post.enqueueDue();
+      const due = (await f.watchdog.wakeState(f.clock.now)).nextWakeAt;
+      if (due === null) throw new Error("Missing retry deadline");
+      f.clock.now = due + 1;
+
       f.receiver.run = () => Promise.resolve("accepted");
       await f.watchdog.tick();
       await f.commit({ ...envelope("other"), address: { id: "other" } });
-      expect(await f.counts()).toEqual([2, 2, 3]);
+      expect(await f.counts()).toEqual([2, 2, 2]);
       await expect(f.purge("owned", true)).rejects.toThrow();
-      expect(await f.counts()).toEqual([2, 2, 3]);
+      expect(await f.counts()).toEqual([2, 2, 2]);
       await f.purge("owned");
       expect(await f.counts()).toEqual([1, 1, 1]);
       expect(await f.post.read("owned")).toBeUndefined();
@@ -176,11 +202,10 @@ export function sqlPostLaws(open: (retry?: SqlPostRetry) => Promise<Fixture>) {
       await f.watchdog.tick();
       expect(await f.post.read("one")).toMatchObject({
         state: "pending",
-        attempts: 1,
       });
       f.clock.now += 2_000;
       const fresh = f.reopen();
-      await fresh.post.enqueueDue();
+
       await fresh.watchdog.tick();
       expect(await fresh.post.read("one")).toEqual({ state: "delivered" });
       expect(f.deliveries).toEqual(["one", "one"]);
@@ -253,15 +278,16 @@ export function sqlPostLaws(open: (retry?: SqlPostRetry) => Promise<Fixture>) {
       const rejected = expect(old).rejects.toThrow("settlement rejected");
       f.clock.now += 120_001;
       const fresh = f.reopen();
+      f.receiver.run = () => Promise.resolve("accepted");
       expect(await fresh.watchdog.tick()).toMatchObject({
         status: "settled",
-        job: { outcome: "interrupted" },
+        job: { outcome: "completed" },
       });
       release();
       await rejected;
-      expect(await f.post.read("one")).toMatchObject({ state: "pending" });
+      expect(await f.post.read("one")).toMatchObject({ state: "delivered" });
       f.receiver.run = () => Promise.resolve("accepted");
-      await fresh.post.enqueueDue();
+
       await fresh.watchdog.tick();
       expect(await fresh.post.read("one")).toEqual({ state: "delivered" });
     } finally {
@@ -348,7 +374,9 @@ export function sqlPostLaws(open: (retry?: SqlPostRetry) => Promise<Fixture>) {
         status: "found",
         job: { state: "running" },
       });
-      expect(await f.reopen().watchdog.tick()).toMatchObject({
+      expect(
+        await f.worker(() => Promise.resolve({ kind: "completed" })).tick(),
+      ).toMatchObject({
         status: "settled",
         job: { outcome: "interrupted" },
       });
@@ -435,7 +463,7 @@ export function sqlPostLaws(open: (retry?: SqlPostRetry) => Promise<Fixture>) {
         attempts: 1,
       });
       f.clock.now += 1_000_000;
-      await f.post.enqueueDue();
+
       expect(await f.watchdog.tick()).toEqual({ status: "no_ready" });
       expect(f.deliveries).toEqual(["one"]);
     } finally {
@@ -468,7 +496,7 @@ export function sqlPostLaws(open: (retry?: SqlPostRetry) => Promise<Fixture>) {
       release();
       await running;
       f.receiver.run = () => Promise.resolve("accepted");
-      await other.post.enqueueDue();
+
       await other.watchdog.tick();
       expect(f.deliveries).toEqual(["one", "two"]);
     } finally {
@@ -518,18 +546,6 @@ export function sqlPostLaws(open: (retry?: SqlPostRetry) => Promise<Fixture>) {
       });
     } finally {
       release();
-      await f.close();
-    }
-  });
-  it("reports a missing durable job rather than silently stranding its envelope", async () => {
-    const f = await open();
-    try {
-      await f.commit(envelope());
-      await f.watchdog.purge('["account","a"]');
-      await expect(f.post.enqueueDue()).rejects.toThrow(
-        "delivery job is missing",
-      );
-    } finally {
       await f.close();
     }
   });

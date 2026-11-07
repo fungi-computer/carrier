@@ -1,9 +1,12 @@
+import type { WatchdogRuntime } from "@fungi.computer/watchdog";
 import * as Schema from "effect/Schema";
-import { expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { Watchdog, type WatchdogExecutor } from "@fungi.computer/watchdog";
 
 import { admitPost, createPost, definePostRoute } from "../src/post.js";
 import { createSqliteOwnerFixture } from "../../watchdog/test/sqlite-owner.fixture.js";
+
+afterEach(() => vi.restoreAllMocks());
 
 const Event = Schema.Struct({ text: Schema.String });
 
@@ -23,6 +26,7 @@ it("joins producer SQLite atomically and recovers a failed receipt without apply
     let loseFirstReceipt = true;
     let calls = 0;
     let now = 100;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
     const wakes: number[] = [];
     const postOwner = {
       ...producer.owner,
@@ -83,9 +87,10 @@ it("joins producer SQLite atomically and recovers a failed receipt without apply
     };
     let execute: WatchdogExecutor = () =>
       Promise.reject(new Error("Post is not open"));
-    const watchdog = await Watchdog.make({
+    const watchdog: WatchdogRuntime = await Watchdog.make({
       owner: producer.owner,
-      execute: (job, signal) => execute(job, signal),
+      retryPolicy: (job) => post.retryPolicy(job),
+      execute: (job, signal, attempt) => execute(job, signal, attempt),
       isAlive: () => Promise.resolve(false),
       wake: { recompute: () => Promise.resolve() },
     });
@@ -93,7 +98,6 @@ it("joins producer SQLite atomically and recovers a failed receipt without apply
       routes,
       owner: postOwner,
       transactional: watchdog.transactional,
-      readJob: watchdog.read,
       now: () => now,
       scheduleWake: (at: number) => {
         wakes.push(at);
@@ -101,7 +105,7 @@ it("joins producer SQLite atomically and recovers a failed receipt without apply
       },
     };
     const post = createPost(options);
-    execute = post.execute;
+    execute = (job, signal, attempt) => post.execute(job, attempt, signal);
     const envelope = {
       key: "fact:one",
       kind: "team",
@@ -126,16 +130,18 @@ it("joins producer SQLite atomically and recovers a failed receipt without apply
       sql.exec("INSERT INTO producer_facts VALUES ('one')");
       post.send(envelope);
     });
-    expect((await watchdog.tick()).status).toBe("settled");
+    expect((await watchdog.tick()).status).toBe("requeued");
     expect(post.read(envelope.key)).toMatchObject({
       state: "pending",
-      attempts: 1,
     });
     expect(calls).toBe(1);
-    expect(wakes).toEqual([2_100]);
+    expect(wakes).toEqual([]);
+    expect(await watchdog.wakeState(now)).toEqual({
+      pending: false,
+      nextWakeAt: 2100,
+    });
 
     now = 2_100;
-    await post.enqueueDue();
     await watchdog.tick();
     expect(post.read(envelope.key)).toEqual({ state: "delivered" });
     expect(
@@ -144,11 +150,10 @@ it("joins producer SQLite atomically and recovers a failed receipt without apply
     expect(calls).toBe(2);
 
     const reopened = createPost(options);
-    execute = reopened.execute;
+    execute = (job, signal, attempt) => reopened.execute(job, attempt, signal);
     producer.owner.transactionSync(() => {
       reopened.send(envelope);
     });
-    await reopened.enqueueDue();
     await watchdog.tick();
     expect(calls).toBe(2);
   } finally {
@@ -157,16 +162,18 @@ it("joins producer SQLite atomically and recovers a failed receipt without apply
   }
 });
 
-it("releases a settled Post retry now without resetting its attempt count", async () => {
+it("releases a queued Post retry now without resetting its attempt count", async () => {
   const producer = createSqliteOwnerFixture();
   try {
     const now = 1_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
     let available = false;
     let execute: WatchdogExecutor = () =>
       Promise.reject(new Error("Post is not open"));
-    const watchdog = await Watchdog.make({
+    const watchdog: WatchdogRuntime = await Watchdog.make({
       owner: producer.owner,
-      execute: (job, signal) => execute(job, signal),
+      retryPolicy: (job) => post.retryPolicy(job),
+      execute: (job, signal, attempt) => execute(job, signal, attempt),
       isAlive: () => Promise.resolve(false),
       wake: { recompute: () => Promise.resolve() },
     });
@@ -188,11 +195,10 @@ it("releases a settled Post retry now without resetting its attempt count", asyn
       routes: { team: route },
       owner: producer.owner,
       transactional: watchdog.transactional,
-      readJob: watchdog.read,
       now: () => now,
       scheduleWake: () => Promise.resolve(),
     });
-    execute = post.execute;
+    execute = (job, signal, attempt) => post.execute(job, attempt, signal);
     producer.owner.transactionSync(() => {
       post.send({
         key: "held",
@@ -205,17 +211,24 @@ it("releases a settled Post retry now without resetting its attempt count", asyn
     await watchdog.tick();
     expect(post.read("held")).toMatchObject({
       state: "pending",
-      attempts: 1,
-      nextAttemptAt: 3_000,
+    });
+    const jobId = post.read("held");
+    expect(await watchdog.wakeState(now)).toEqual({
+      pending: false,
+      nextWakeAt: 3000,
     });
     available = true;
     expect(await post.releaseNow()).toBeUndefined();
     expect(post.read("held")).toMatchObject({
       state: "pending",
-      attempts: 1,
-      nextAttemptAt: now,
     });
 
+    expect(post.read("held")).toEqual(jobId);
+    expect(
+      producer.owner.sql
+        .exec("SELECT attempt_count,not_before FROM watchdog_jobs")
+        .toArray(),
+    ).toEqual([{ attempt_count: 1, not_before: now }]);
     await watchdog.tick();
     expect(post.read("held")).toMatchObject({ state: "delivered" });
   } finally {
@@ -223,9 +236,10 @@ it("releases a settled Post retry now without resetting its attempt count", asyn
   }
 });
 
-it("retries a dead letter after queued successors and expedites a settled failure without duplicating live jobs", async () => {
+it("retries a dead letter after queued successors and expedites a queued failure without duplicating live jobs", async () => {
   const producer = createSqliteOwnerFixture();
   try {
+    vi.spyOn(Date, "now").mockReturnValue(100);
     const received: string[] = [];
     let rejectFirst = true;
     let unavailable = true;
@@ -249,9 +263,10 @@ it("retries a dead letter after queued successors and expedites a settled failur
     });
     let execute: WatchdogExecutor = () =>
       Promise.reject(new Error("Post is not open"));
-    const watchdog = await Watchdog.make({
+    const watchdog: WatchdogRuntime = await Watchdog.make({
       owner: producer.owner,
-      execute: (job, signal) => execute(job, signal),
+      retryPolicy: (job) => post.retryPolicy(job),
+      execute: (job, signal, attempt) => execute(job, signal, attempt),
       isAlive: () => Promise.resolve(false),
       wake: { recompute: () => Promise.resolve() },
     });
@@ -259,12 +274,11 @@ it("retries a dead letter after queued successors and expedites a settled failur
       routes: { team: route },
       owner: producer.owner,
       transactional: watchdog.transactional,
-      readJob: watchdog.read,
       now: () => 100,
       scheduleWake: () => Promise.resolve(),
     };
     const post = createPost(options);
-    execute = post.execute;
+    execute = (job, signal, attempt) => post.execute(job, attempt, signal);
     const send = (key: string) => {
       producer.owner.transactionSync(() => {
         post.send({
@@ -284,7 +298,7 @@ it("retries a dead letter after queued successors and expedites a settled failur
     });
     rejectFirst = false;
     const reopened = createPost(options);
-    execute = reopened.execute;
+    execute = (job, signal, attempt) => reopened.execute(job, attempt, signal);
     await reopened.retry("one");
     send("three");
     await reopened.retry("two");
@@ -298,8 +312,6 @@ it("retries a dead letter after queued successors and expedites a settled failur
     await watchdog.tick();
     expect(reopened.read("four")).toMatchObject({
       state: "pending",
-      attempts: 1,
-      nextAttemptAt: 2_100,
     });
     unavailable = false;
     await reopened.retry("four");

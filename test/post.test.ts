@@ -1,3 +1,4 @@
+import type { WatchdogRuntime } from "@fungi.computer/watchdog";
 import { afterEach, expect, it, vi } from "vitest";
 import * as Schema from "effect/Schema";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -10,16 +11,10 @@ import {
   createPost,
   definePostRoute,
 } from "../src/post.js";
-import type { PostEnvelope } from "../src/post.js";
+import type { PostEnvelope, PostRegistryRoute } from "../src/post.js";
 import { openSqlPost } from "../src/internal/post-sql.js";
 import { deliverPost } from "../src/internal/post-execution.js";
-import type {
-  WatchdogQueuedJob,
-  WatchdogRunningJob,
-  WatchdogReadResult,
-  WatchdogSqliteOwner,
-  WatchdogTransactionalProjection,
-} from "@fungi.computer/watchdog";
+import { Watchdog, type WatchdogSqliteOwner } from "@fungi.computer/watchdog";
 
 import { createSqliteOwnerFixture } from "../../watchdog/test/sqlite-owner.fixture.js";
 
@@ -27,6 +22,7 @@ const fixtures: ReturnType<typeof createSqliteOwnerFixture>[] = [];
 const temporaryDirectories: string[] = [];
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   for (const fixture of fixtures.splice(0)) fixture.close();
   for (const directory of temporaryDirectories.splice(0))
     rmSync(directory, { recursive: true, force: true });
@@ -50,25 +46,40 @@ const sqliteOwner = () => {
   return fixture.owner;
 };
 
-const running = (job: WatchdogQueuedJob | undefined): WatchdogRunningJob => {
-  if (job === undefined) throw new Error("missing queued job");
-  return { ...job, state: "running" };
-};
-const settledJob = (
-  jobs: readonly WatchdogQueuedJob[],
-  id: string,
-): Promise<WatchdogReadResult> => {
-  const job = jobs.find((candidate) => candidate.jobId === id);
-  return Promise.resolve(
-    job === undefined
-      ? { status: "missing" }
-      : {
-          status: "found",
-          job: { ...job, state: "settled", outcome: "completed" },
-          cancellation: { status: "absent" },
-        },
-  );
-};
+async function openPost<R extends Record<string, PostRegistryRoute>>(
+  options: Omit<Parameters<typeof createPost<R>>[0], "transactional">,
+) {
+  if (options.now !== Date.now)
+    vi.spyOn(Date, "now").mockImplementation(options.now);
+  const watchdog: WatchdogRuntime = await Watchdog.make({
+    owner: options.owner,
+    isAlive: () => Promise.resolve(false),
+    retryPolicy: (job) => post.retryPolicy(job),
+    execute: (job, signal, attempt) => post.execute(job, attempt, signal),
+    wake: {
+      recompute: async () => {
+        const state = await watchdog.wakeState(options.now());
+        const due = state.pending ? options.now() : state.nextWakeAt;
+        if (due !== null) await options.scheduleWake(due);
+      },
+    },
+  });
+  const post = createPost({
+    ...options,
+    transactional: watchdog.transactional,
+  });
+  return {
+    ...post,
+    tick: watchdog.tick,
+    wakeState: () => watchdog.wakeState(options.now()),
+    jobs: () =>
+      options.owner.sql
+        .exec(
+          "SELECT job_id,queue_name,attempt_count FROM watchdog_jobs ORDER BY sequence",
+        )
+        .toArray(),
+  };
+}
 
 const address = Schema.Struct({ teamId: Schema.String });
 const event = Schema.Struct({ text: Schema.String });
@@ -110,14 +121,13 @@ it("turns an undecodable receiver reply into unavailable evidence with its cause
 
 it("encodes domain values for delivery and decodes receipt callbacks with the maintained schema", async () => {
   const owner = sqliteOwner();
-  const jobs: WatchdogQueuedJob[] = [];
   const wire: PostEnvelope[] = [];
   const applied: number[] = [];
   const acknowledged: number[] = [];
   const receipts = new Set<string>();
   const address = Schema.Struct({ teamId: Schema.NumberFromString });
   const event = Schema.Struct({ sequence: Schema.NumberFromString });
-  const post = createPost({
+  const post = await openPost({
     owner,
     routes: {
       fact: definePostRoute({
@@ -154,15 +164,7 @@ it("encodes domain values for delivery and decodes receipt callbacks with the ma
         },
       }),
     },
-    transactional: {
-      enqueueAcceptedJob: (job) => {
-        jobs.push(job);
-      },
-      readQueueHead: () => ({ state: "idle" }),
-      readLatestSettledJob: () => undefined,
-      recordCancellationIntent: () => ({ status: "missing" }),
-    },
-    readJob: (id) => settledJob(jobs, id),
+
     now: () => 1_000,
     scheduleWake: () => Promise.resolve(),
   });
@@ -174,7 +176,7 @@ it("encodes domain values for delivery and decodes receipt callbacks with the ma
       event: { sequence: 7 },
     });
   });
-  await post.execute(running(jobs[0]));
+  await post.tick();
   expect(wire).toMatchObject([
     { address: { teamId: "42" }, event: { sequence: "7" } },
   ]);
@@ -186,7 +188,6 @@ it("encodes domain values for delivery and decodes receipt callbacks with the ma
 
 it("commits an addressed Watchdog job and keeps its receipt through replay", async () => {
   const owner = sqliteOwner();
-  const jobs: WatchdogQueuedJob[] = [];
   const received: string[] = [];
   const receipts = new Set<string>();
   const wakes: number[] = [];
@@ -196,14 +197,6 @@ it("commits an addressed Watchdog job and keeps its receipt through replay", asy
   const firstDelivery = new Promise<void>((resolve) => {
     releaseFirst = resolve;
   });
-  const transactional: WatchdogTransactionalProjection = {
-    enqueueAcceptedJob: (job) => {
-      jobs.push(job);
-    },
-    readQueueHead: () => ({ state: "idle" }),
-    readLatestSettledJob: () => undefined,
-    recordCancellationIntent: () => ({ status: "missing" }),
-  };
   const route = definePostRoute({
     addressKind: "team",
     address,
@@ -233,32 +226,31 @@ it("commits an addressed Watchdog job and keeps its receipt through replay", asy
   const options = {
     routes: { team: route },
     owner,
-    transactional,
-    readJob: (id: string) => settledJob(jobs, id),
+
     now: () => 100,
     scheduleWake: (at: number) => {
       wakes.push(at);
       return Promise.resolve();
     },
   };
-  const post = createPost(options);
+  const post = await openPost(options);
   post.send({
     key: "one",
     kind: "team",
     address: { teamId: "t1" },
     event: { text: "hello" },
   });
-  expect(post.nextWake()).toBe(100);
-  expect(jobs).toHaveLength(1);
-  expect(jobs[0]?.queue).toBe('["team","t1"]');
-  const firstExecution = post.execute(running(jobs[0]));
+  expect((await post.wakeState()).pending).toBe(true);
+  expect(post.jobs()).toHaveLength(1);
+  expect(post.jobs()[0]?.queue_name).toBe('["team","t1"]');
+  const firstExecution = post.tick();
   post.send({
     key: "two",
     kind: "team",
     address: { teamId: "t1" },
     event: { text: "later" },
   });
-  expect(jobs).toHaveLength(1);
+  expect(post.jobs()).toHaveLength(2);
   expect(post.latest("team", { teamId: "t1" })).toMatchObject({
     key: "two",
     row: { state: "pending" },
@@ -266,31 +258,30 @@ it("commits an addressed Watchdog job and keeps its receipt through replay", asy
   expect(post.latest("team", { teamId: "other" })).toBeUndefined();
   releaseFirst();
   await firstExecution;
-  expect(jobs).toHaveLength(2);
-  await post.execute(running(jobs[1]));
+  expect(post.jobs()).toHaveLength(2);
+  await post.tick();
   post.send({
     key: "one",
     kind: "team",
     address: { teamId: "t1" },
     event: { text: "hello" },
   });
-  await post.execute(running(jobs[0]));
-  expect(jobs).toHaveLength(2);
+  await post.tick();
+  expect(post.jobs()).toHaveLength(2);
   expect(received).toEqual(["t1:hello", "t1:later"]);
-  expect(post.read("one")).toEqual({ state: "delivered", nextKey: "two" });
-  expect(createPost(options).latest("team", { teamId: "t1" })).toEqual({
+  expect(post.read("one")).toEqual({ state: "delivered" });
+  expect((await openPost(options)).latest("team", { teamId: "t1" })).toEqual({
     key: "two",
     row: { state: "delivered" },
   });
-  expect(post.nextWake()).toBeNull();
-  expect(wakes).toEqual([2_100, 2_100]);
+  expect((await post.wakeState()).nextWakeAt).toBeNull();
+  expect((await post.wakeState()).pending).toBe(false);
 });
 
 it("commits a typed receiver cursor with the producer receipt", async () => {
   const owner = sqliteOwner();
-  const jobs: WatchdogQueuedJob[] = [];
   const cursors: number[] = [];
-  const post = createPost({
+  const post = await openPost({
     routes: {
       team: definePostRoute({
         addressKind: "team",
@@ -309,15 +300,7 @@ it("commits a typed receiver cursor with the producer receipt", async () => {
       }),
     },
     owner,
-    transactional: {
-      enqueueAcceptedJob: (job) => {
-        jobs.push(job);
-      },
-      readQueueHead: () => ({ state: "idle" }),
-      readLatestSettledJob: () => undefined,
-      recordCancellationIntent: () => ({ status: "missing" }),
-    },
-    readJob: (id) => settledJob(jobs, id),
+
     now: () => 100,
     scheduleWake: () => Promise.resolve(),
   });
@@ -327,18 +310,17 @@ it("commits a typed receiver cursor with the producer receipt", async () => {
     address: { teamId: "t1" },
     event: { text: "hello" },
   });
-  await post.execute(running(jobs[0]));
+  await post.tick();
   expect(post.read("cursor")).toEqual({ state: "delivered" });
   expect(cursors).toEqual([7]);
 });
 
 it("bounds unavailable delivery at twenty attempts and retains inspectable dead letters", async () => {
   const owner = sqliteOwner();
-  const jobs: WatchdogQueuedJob[] = [];
   const wakes: number[] = [];
   let now = 100;
   let refuse = false;
-  const post = createPost({
+  const post = await openPost({
     routes: {
       team: definePostRoute({
         addressKind: "team",
@@ -356,16 +338,8 @@ it("bounds unavailable delivery at twenty attempts and retains inspectable dead 
       }),
     },
     owner,
-    transactional: {
-      enqueueAcceptedJob: (job) => {
-        jobs.push(job);
-      },
-      readQueueHead: () => ({ state: "idle" }),
-      readLatestSettledJob: () => undefined,
-      recordCancellationIntent: () => ({ status: "missing" }),
-    },
     now: () => now,
-    readJob: (id) => settledJob(jobs, id),
+
     scheduleWake: (at) => {
       wakes.push(at);
       return Promise.resolve();
@@ -377,17 +351,17 @@ it("bounds unavailable delivery at twenty attempts and retains inspectable dead 
     address: { teamId: "t1" },
     event: { text: "x" },
   });
-  await post.execute(running(jobs[0]));
+  await post.tick();
   expect(wakes).toEqual([2_100]);
-  expect(post.nextWake()).toBe(2_100);
+  expect((await post.wakeState()).nextWakeAt).toBe(2_100);
   for (let attempt = 1; attempt < 20; attempt += 1) {
     now += Math.min(2_000 * 2 ** (attempt - 1), 300_000);
     expect(wakes.at(-1)).toBe(now);
-    await post.enqueueDue();
-    await post.execute(running(jobs.at(-1)));
+
+    await post.tick();
   }
-  await post.enqueueDue();
-  expect(jobs).toHaveLength(20);
+
+  expect(post.jobs()).toMatchObject([{ attempt_count: 20 }]);
   expect(post.deadLetters().letters).toMatchObject([
     {
       key: "post:retry",
@@ -403,7 +377,7 @@ it("bounds unavailable delivery at twenty attempts and retains inspectable dead 
     address: { teamId: "t1" },
     event: { text: "refuse" },
   });
-  await post.execute(running(jobs.at(-1)));
+  await post.tick();
   expect(post.deadLetters().letters[0]).toMatchObject({
     key: "post:refused",
     reason: "refused",
@@ -417,20 +391,11 @@ it("retries a seven-day route past the attempt ceiling and expires after physica
   temporaryDirectories.push(directory);
   const filename = join(directory, "post.sqlite");
   let fixture = sqliteFixture(filename);
-  const jobs: WatchdogQueuedJob[] = [];
   let now = 100;
   let deliveries = 0;
   const startAt = now;
   const deadlineMs = 604_800_000;
   const deadlineAt = startAt + deadlineMs;
-  const transactional: WatchdogTransactionalProjection = {
-    enqueueAcceptedJob: (job) => {
-      jobs.push(job);
-    },
-    readQueueHead: () => ({ state: "idle" }),
-    readLatestSettledJob: () => undefined,
-    recordCancellationIntent: () => ({ status: "missing" }),
-  };
   const routes = {
     team: definePostRoute({
       addressKind: "team",
@@ -449,15 +414,14 @@ it("retries a seven-day route past the attempt ceiling and expires after physica
     }),
   };
   const open = (owner: WatchdogSqliteOwner) =>
-    createPost({
+    openPost({
       routes,
       owner,
-      transactional,
-      readJob: (id) => settledJob(jobs, id),
+
       now: () => now,
       scheduleWake: () => Promise.resolve(),
     });
-  let post = open(fixture.owner);
+  let post = await open(fixture.owner);
   post.send({
     key: "seven-day-deadline",
     kind: "team",
@@ -466,19 +430,19 @@ it("retries a seven-day route past the attempt ceiling and expires after physica
   });
 
   for (let attempts = 1; attempts <= 20; attempts += 1) {
-    await post.execute(running(jobs.at(-1)));
+    await post.tick();
     const row = post.read("seven-day-deadline");
     expect(row).toMatchObject({
       state: "pending",
-      attempts,
       deadlineAt,
     });
     expect(post.deadLetters().letters).toEqual([]);
     if (attempts < 20) {
       if (row?.state !== "pending")
         throw new Error("Expected a pending seven-day route");
-      now = row.nextAttemptAt;
-      await post.enqueueDue();
+      const due = (await post.wakeState()).nextWakeAt;
+      if (due === null) throw new Error("Missing retained retry deadline");
+      now = due;
     }
   }
   expect(now - startAt).toBe(3_810_000);
@@ -486,24 +450,25 @@ it("retries a seven-day route past the attempt ceiling and expires after physica
 
   fixture.close();
   fixture = sqliteFixture(filename);
-  post = open(fixture.owner);
+  post = await open(fixture.owner);
   now = startAt + 6 * 24 * 60 * 60 * 1_000;
-  await post.enqueueDue();
-  await post.execute(running(jobs.at(-1)));
+
+  await post.tick();
   expect(post.read("seven-day-deadline")).toMatchObject({
     state: "pending",
-    attempts: 21,
     deadlineAt,
   });
+  expect(post.jobs()).toMatchObject([{ attempt_count: 21 }]);
   expect(post.deadLetters().letters).toEqual([]);
   expect(deliveries).toBe(21);
 
   fixture.close();
   fixture = sqliteFixture(filename);
-  post = open(fixture.owner);
+  post = await open(fixture.owner);
   now = deadlineAt + 1;
-  const settledJobs = jobs.length;
-  await post.enqueueDue();
+  const settledJobs = post.jobs().length;
+  await post.tick();
+
   expect(post.read("seven-day-deadline")).toMatchObject({
     state: "dead",
     reason: "expired",
@@ -519,24 +484,15 @@ it("retries a seven-day route past the attempt ceiling and expires after physica
       attempts: 21,
     },
   ]);
-  await post.enqueueDue();
-  expect(jobs).toHaveLength(settledJobs);
+
+  expect(post.jobs()).toHaveLength(settledJobs);
   expect(deliveries).toBe(21);
 });
 
 it("expires a route whose active delivery fails after its deadline", async () => {
   const owner = sqliteOwner();
-  const jobs: WatchdogQueuedJob[] = [];
   let now = 100;
-  const transactional: WatchdogTransactionalProjection = {
-    enqueueAcceptedJob: (job) => {
-      jobs.push(job);
-    },
-    readQueueHead: () => ({ state: "idle" }),
-    readLatestSettledJob: () => undefined,
-    recordCancellationIntent: () => ({ status: "missing" }),
-  };
-  const post = createPost({
+  const post = await openPost({
     routes: {
       team: definePostRoute({
         addressKind: "team",
@@ -555,8 +511,7 @@ it("expires a route whose active delivery fails after its deadline", async () =>
       }),
     },
     owner,
-    transactional,
-    readJob: (id) => settledJob(jobs, id),
+
     now: () => now,
     scheduleWake: () => Promise.resolve(),
   });
@@ -567,7 +522,7 @@ it("expires a route whose active delivery fails after its deadline", async () =>
     event: { text: "x" },
   });
 
-  await post.execute(running(jobs[0]));
+  await post.tick();
 
   expect(post.read("crossed-deadline")).toMatchObject({
     state: "dead",
@@ -595,12 +550,10 @@ it("refuses deadline routes on relational Post adapters with a typed reason", ()
     openSqlPost(
       {
         query: () => Promise.resolve([]),
-        commit: () => Promise.resolve(),
       },
       {
         routes: { team: route },
         now: () => 100,
-        scheduleWake: () => Promise.resolve(),
       },
     ),
   ).toThrow(
@@ -612,15 +565,20 @@ it("refuses deadline routes on relational Post adapters with a typed reason", ()
 });
 
 it("times out a hung receiver, preserves its retry, and lets the next recipient run", async () => {
-  vi.useFakeTimers();
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
   vi.setSystemTime(100);
   const owner = sqliteOwner();
-  const jobs: WatchdogQueuedJob[] = [];
   let release: (result: "accepted") => void = () => undefined;
+  let begin: () => void = () => {
+    throw new Error("Missing start observer");
+  };
+  const started = new Promise<void>((resolve) => {
+    begin = resolve;
+  });
   const hung = new Promise<"accepted">((resolve) => {
     release = resolve;
   });
-  const post = createPost({
+  const post = await openPost({
     routes: {
       team: definePostRoute({
         addressKind: "team",
@@ -629,22 +587,18 @@ it("times out a hung receiver, preserves its retry, and lets the next recipient 
         name: (to) => to.teamId,
         namespace: {
           getByName: (name) => ({
-            deliver: () =>
-              name === "hung" ? hung : Promise.resolve("accepted" as const),
+            deliver: () => {
+              begin();
+              return name === "hung"
+                ? hung
+                : Promise.resolve("accepted" as const);
+            },
           }),
         },
       }),
     },
     owner,
-    transactional: {
-      enqueueAcceptedJob: (job) => {
-        jobs.push(job);
-      },
-      readQueueHead: () => ({ state: "idle" }),
-      readLatestSettledJob: () => undefined,
-      recordCancellationIntent: () => ({ status: "missing" }),
-    },
-    readJob: (id) => settledJob(jobs, id),
+
     now: Date.now,
     scheduleWake: () => Promise.resolve(),
   });
@@ -660,25 +614,25 @@ it("times out a hung receiver, preserves its retry, and lets the next recipient 
     address: { teamId: "healthy" },
     event: { text: "second" },
   });
-  const attempt = post.execute(running(jobs[0]));
+  const attempt = post.tick();
+  await started;
   await vi.advanceTimersByTimeAsync(10_000);
   await attempt;
-  expect(post.read("hung")).toMatchObject({ state: "pending", attempts: 1 });
-  await post.execute(running(jobs[1]));
-  expect(post.nextWake()).toBe(Date.now() + 2_000);
+  expect(post.read("hung")).toMatchObject({ state: "pending" });
+  await post.tick();
+  expect((await post.wakeState()).nextWakeAt).toBe(Date.now() + 2_000);
   expect(post.read("healthy")).toEqual({ state: "delivered" });
   release("accepted");
   await Promise.resolve();
-  expect(post.read("hung")).toMatchObject({ state: "pending", attempts: 1 });
+  expect(post.read("hung")).toMatchObject({ state: "pending" });
   await vi.advanceTimersByTimeAsync(2_000);
-  await post.enqueueDue();
-  await post.execute(running(jobs.at(-1)));
+
+  await post.tick();
   expect(post.read("hung")).toEqual({ state: "delivered" });
 });
 
 it("orders different event kinds for one recipient through lost receipts without delaying another namespace", async () => {
   const owner = sqliteOwner();
-  const jobs: WatchdogQueuedJob[] = [];
   const applied: string[] = [];
   const receipts = new Set<string>();
   let loseReceipt = true;
@@ -717,19 +671,11 @@ it("orders different event kinds for one recipient through lost receipts without
       member: route("memberInbox"),
     },
     owner,
-    transactional: {
-      enqueueAcceptedJob: (job: WatchdogQueuedJob) => {
-        jobs.push(job);
-      },
-      readQueueHead: () => ({ state: "idle" as const }),
-      readLatestSettledJob: () => undefined,
-      recordCancellationIntent: () => ({ status: "missing" as const }),
-    },
-    readJob: (id: string) => settledJob(jobs, id),
+
     now: () => now,
     scheduleWake: () => Promise.resolve(),
   };
-  let post = createPost(options);
+  let post = await openPost(options);
   for (const kind of ["home", "control", "member"] as const)
     post.send({
       key: kind,
@@ -740,27 +686,26 @@ it("orders different event kinds for one recipient through lost receipts without
   expect(post.latest("home", { teamId: "same-name" })?.key).toBe("home");
   expect(post.latest("control", { teamId: "same-name" })?.key).toBe("control");
   expect(post.latest("member", { teamId: "same-name" })?.key).toBe("member");
-  expect(jobs).toHaveLength(2);
-  await post.execute(running(jobs[0]));
-  await post.execute(running(jobs[1]));
+  expect(post.jobs()).toHaveLength(3);
+  await post.tick();
+  await post.tick();
   expect(applied).toEqual(["home", "member"]);
-  expect(post.read("control")).toMatchObject({ state: "pending", attempts: 0 });
-  expect(post.nextWake()).toBe(2_100);
-  post = createPost(options);
+  expect(post.read("control")).toMatchObject({ state: "pending" });
+  expect((await post.wakeState()).nextWakeAt).toBe(2_100);
+  post = await openPost(options);
   now = 2_100;
-  await post.enqueueDue();
-  expect(jobs).toHaveLength(3);
-  await post.execute(running(jobs[2]));
-  expect(jobs).toHaveLength(4);
-  await post.execute(running(jobs[3]));
+
+  expect(post.jobs()).toHaveLength(3);
+  await post.tick();
+  expect(post.jobs()).toHaveLength(3);
+  await post.tick();
   expect(applied).toEqual(["home", "member", "control"]);
-  expect(post.read("home")).toEqual({ state: "delivered", nextKey: "control" });
-  expect(post.nextWake()).toBeNull();
+  expect(post.read("home")).toEqual({ state: "delivered" });
+  expect((await post.wakeState()).nextWakeAt).toBeNull();
 });
 
 it("persists a prepared fact before delivery and commits its producer acknowledgment with the receipt", async () => {
   const owner = sqliteOwner();
-  const jobs: WatchdogQueuedJob[] = [];
   let now = 100;
   let prepareCount = 0;
   let loseResponse = true;
@@ -815,15 +760,7 @@ it("persists a prepared fact before delivery and commits its producer acknowledg
   const options = {
     routes: { team: route },
     owner,
-    transactional: {
-      enqueueAcceptedJob: (job: WatchdogQueuedJob) => {
-        jobs.push(job);
-      },
-      readQueueHead: () => ({ state: "idle" as const }),
-      readLatestSettledJob: () => undefined,
-      recordCancellationIntent: () => ({ status: "missing" as const }),
-    },
-    readJob: (id: string) => settledJob(jobs, id),
+
     now: () => now,
     scheduleWake: () => Promise.resolve(),
   };
@@ -833,15 +770,14 @@ it("persists a prepared fact before delivery and commits its producer acknowledg
     address: { teamId: "t1" },
     event: { revision: 1 },
   } as const;
-  const post = createPost(options);
+  const post = await openPost(options);
   post.send(input);
-  await post.execute(running(jobs[0]));
+  await post.tick();
   expect(post.read(input.key)).toMatchObject({
     state: "pending",
-    attempts: 1,
     delivery: { event: { grant: "sealed-1", expiresAt: "60100" } },
   });
-  const reopened = createPost(options);
+  const reopened = await openPost(options);
   reopened.send(input);
   expect(() => {
     reopened.send({ ...input, event: { revision: 2 } });
@@ -852,16 +788,14 @@ it("persists a prepared fact before delivery and commits its producer acknowledg
     }),
   );
   now = 2_100;
-  await reopened.enqueueDue();
-  await expect(reopened.execute(running(jobs.at(-1)))).rejects.toThrow(
-    "Producer acknowledgment failed",
-  );
+
+  await expect(reopened.tick()).resolves.toMatchObject({ status: "requeued" });
   expect(reopened.read(input.key)).toMatchObject({ state: "pending" });
   expect(owner.sql.exec("SELECT * FROM grant_expiry").toArray()).toEqual([]);
   rejectAck = false;
   now = 10_100;
-  await reopened.enqueueDue();
-  await reopened.execute(running(jobs.at(-1)));
+
+  await reopened.tick();
   expect(prepareCount).toBe(1);
   expect(received).toEqual(
     Array.from({ length: 3 }, () => ({
@@ -877,19 +811,24 @@ it("persists a prepared fact before delivery and commits its producer acknowledg
 });
 
 it("bounds preparation and ignores a fact prepared after its attempt timed out", async () => {
-  vi.useFakeTimers();
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
   vi.setSystemTime(100);
   const owner = sqliteOwner();
-  const jobs: WatchdogQueuedJob[] = [];
   const received: unknown[] = [];
   let release: (value: { text: string }) => void = () => {
     throw new Error("Preparation did not start");
   };
+  let begin: () => void = () => {
+    throw new Error("Missing start observer");
+  };
+  const started = new Promise<void>((resolve) => {
+    begin = resolve;
+  });
   const hung = new Promise<{ text: string }>((resolve) => {
     release = resolve;
   });
   let first = true;
-  const post = createPost({
+  const post = await openPost({
     routes: {
       team: definePostRoute({
         addressKind: "team",
@@ -901,6 +840,7 @@ it("bounds preparation and ignores a fact prepared after its attempt timed out",
           run: (_to, intent) => {
             if (first) {
               first = false;
+              begin();
               return hung;
             }
             return Promise.resolve(intent);
@@ -910,22 +850,14 @@ it("bounds preparation and ignores a fact prepared after its attempt timed out",
           getByName: () => ({
             deliver: (envelope: PostEnvelope) => {
               received.push(envelope.event);
-              return Promise.resolve("accepted" as const);
+              return Promise.resolve("accepted");
             },
           }),
         },
       }),
     },
     owner,
-    transactional: {
-      enqueueAcceptedJob: (job) => {
-        jobs.push(job);
-      },
-      readQueueHead: () => ({ state: "idle" }),
-      readLatestSettledJob: () => undefined,
-      recordCancellationIntent: () => ({ status: "missing" }),
-    },
-    readJob: (id) => settledJob(jobs, id),
+
     now: Date.now,
     scheduleWake: () => Promise.resolve(),
   });
@@ -935,7 +867,8 @@ it("bounds preparation and ignores a fact prepared after its attempt timed out",
     address: { teamId: "t1" },
     event: { text: "current" },
   });
-  const attempt = post.execute(running(jobs[0]));
+  const attempt = post.tick();
+  await started;
   await vi.advanceTimersByTimeAsync(10_000);
   await attempt;
   release({ text: "late" });
@@ -943,11 +876,68 @@ it("bounds preparation and ignores a fact prepared after its attempt timed out",
   expect(received).toEqual([]);
   expect(post.read("hung-preparation")).toMatchObject({
     state: "pending",
-    attempts: 1,
   });
   await vi.advanceTimersByTimeAsync(2_000);
-  await post.enqueueDue();
-  await post.execute(running(jobs.at(-1)));
+
+  await post.tick();
   expect(received).toEqual([{ text: "current" }]);
   expect(post.read("hung-preparation")).toEqual({ state: "delivered" });
+});
+
+it("refuses a pre-scheduler SQLite Post store without loading, admitting or rewriting it", async () => {
+  const owner = sqliteOwner();
+  const received: string[] = [];
+  owner.sql.exec(
+    "CREATE TABLE carrier_post_rows (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+  );
+  // A pending row as Post wrote it before the Watchdog scheduler (Fungi 0.14).
+  owner.sql.exec(
+    "INSERT INTO carrier_post_rows VALUES (?,?)",
+    "post:retained",
+    JSON.stringify({
+      state: "pending",
+      envelope: {
+        key: "retained",
+        kind: "team",
+        address: { teamId: "team-a" },
+        event: { text: "kept" },
+      },
+      attempts: 0,
+      nextAttemptAt: 100,
+      jobId: "retained-job",
+    }),
+  );
+  const rows = () =>
+    owner.sql.exec("SELECT key,value FROM carrier_post_rows").toArray();
+  const before = rows();
+  const route = definePostRoute({
+    addressKind: "team",
+    address,
+    event,
+    name: (to) => to.teamId,
+    namespace: {
+      getByName: () => ({
+        deliver: (envelope: PostEnvelope) => {
+          received.push(envelope.key);
+          return Promise.resolve("accepted");
+        },
+      }),
+    },
+  });
+  await expect(
+    openPost({
+      routes: { team: route },
+      owner,
+      now: () => 100,
+      scheduleWake: () => Promise.resolve(),
+    }),
+  ).rejects.toMatchObject({
+    _tag: "PostError",
+    reason: "pre-scheduler-store",
+  });
+  expect(rows()).toEqual(before);
+  expect(
+    owner.sql.exec("SELECT COUNT(*) AS count FROM watchdog_jobs").one(),
+  ).toEqual({ count: 0 });
+  expect(received).toEqual([]);
 });

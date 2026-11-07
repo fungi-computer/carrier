@@ -21,7 +21,7 @@ import {
 } from "./internal/post-sql.js";
 
 export type { SqlPostOptions, SqlPostRuntime } from "./internal/post-sql.js";
-/** Trusted SELECT yielding post_key, envelope_json, queue_name, next_attempt_at and job_id. */
+/** Trusted SELECT yielding post_key, envelope_json, queue_name and job_id. */
 export type D1PostSource = Readonly<{
   /** Trusted native SELECT text with SQLite ?NNN bindings. */
   text: string;
@@ -56,12 +56,6 @@ export function createD1Post<R extends Record<string, PostRegistryRoute>>(
   const runtime = openSqlPost(
     {
       query: async (statement) => (await prepare(statement).all<Row>()).results,
-      commit: async (statements, key, jobId) => {
-        await options.database.batch([
-          ...statements.map(prepare),
-          options.watchdog.enqueueFromSelect(jobSelect(key, false, jobId)),
-        ]);
-      },
     },
     options,
   );
@@ -88,7 +82,7 @@ export function prepareD1PostAdmission(
     database.prepare(admitPostSelect(source).text).bind(...source.values),
     prepareD1Admission(database).enqueueFromSelect({
       text: `SELECT p.job_id,p.queue_name,'post' AS lane,0 AS priority,
-        json_object('postKey',p.post_key) AS payload_json,CAST(NULL AS INTEGER) AS recovery_max
+        json_object('postKey',p.post_key) AS payload_json,CAST(NULL AS INTEGER) AS recovery_max,CAST(NULL AS INTEGER) AS recovery_window_ms,CAST(0 AS INTEGER) AS not_before
         FROM carrier_post_rows p JOIN (${source.text}) AS source ON p.post_key=source.post_key
         WHERE p.state='pending'`,
       values: source.values,

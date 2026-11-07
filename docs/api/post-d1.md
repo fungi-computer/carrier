@@ -22,7 +22,6 @@ type SqlPostOptions<R> = Readonly<{
     maxDelayMs: number;
   }>;
   now: () => number;
-  scheduleWake: (at) => Promise<void>;
 }>;
 ```
 
@@ -40,15 +39,8 @@ SQL native Carrier runtime configuration; route decisions remain in Post.
 
 ```ts
 type SqlPostRuntime = Readonly<{
-  execute: (
-    job,
-    signal?,
-  ) => Promise<
-    Readonly<{
-      kind: "completed";
-    }>
-  >;
-  enqueueDue: (limit?, afterKey?) => Promise<string | undefined>;
+  retryPolicy: (job) => Promise<WatchdogRetryPolicy>;
+  execute: (job, attempt, signal?) => Promise<WatchdogExecutionDecision>;
   read: (key) => Promise<PostRow | undefined>;
 }>;
 ```
@@ -66,8 +58,7 @@ type D1PostSource = Readonly<{
 }>;
 ```
 
-Trusted SELECT yielding post_key, envelope_json, queue_name, next_attempt_at and
-job_id.
+Trusted SELECT yielding post_key, envelope_json, queue_name and job_id.
 
 ---
 
@@ -124,9 +115,9 @@ Bind the Post registry to D1; route deadlines are rejected with PostError.
 
 #### Parameters
 
-| Parameter | Type                                                                                                                                                                                                                                                                                                                                 |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `options` | `Readonly`\<\{ `routes`: `R`; `failureDetail?`: (`cause`) => `string`; `retry?`: `Readonly`\<\{ `maxAttempts`: `number`; `baseDelayMs`: `number`; `maxDelayMs`: `number`; \}\>; `now`: () => `number`; `scheduleWake`: (`at`) => `Promise`\<`void`\>; \}\> & `Readonly`\<\{ `database`: `D1Database`; `watchdog`: `D1Watchdog`; \}\> |
+| Parameter | Type                                                                                                                                                                                                                                                                                  |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `options` | `Readonly`\<\{ `routes`: `R`; `failureDetail?`: (`cause`) => `string`; `retry?`: `Readonly`\<\{ `maxAttempts`: `number`; `baseDelayMs`: `number`; `maxDelayMs`: `number`; \}\>; `now`: () => `number`; \}\> & `Readonly`\<\{ `database`: `D1Database`; `watchdog`: `D1Watchdog`; \}\> |
 
 #### Returns
 

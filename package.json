@@ -1,6 +1,6 @@
 {
   "name": "@fungi.computer/carrier",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "author": "Levi <levi@technomancy.dev>",
   "description": "Durable email submission and recipient delivery tracking",
   "type": "module",
@@ -34,10 +34,6 @@
     "./post-postgres": {
       "types": "./dist/post-postgres.d.ts",
       "import": "./dist/post-postgres.js"
-    },
-    "./testing": {
-      "types": "./dist/testing.d.ts",
-      "import": "./dist/testing.js"
     }
   },
   "files": [

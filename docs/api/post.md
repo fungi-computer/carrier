@@ -12,12 +12,13 @@
 
 ### PostError
 
-Post rejected an unknown route, conflicting key, or unsupported policy.
+Post rejected an unknown route, conflicting key, unsupported policy or store.
 
 #### Extends
 
 - `YieldableError`\<`this`\> & `object` & `Readonly`\<\{ `message`: `string`;
-  `reason?`: `"relational-deadline-unsupported"`; \}\>
+  `reason?`: `"relational-deadline-unsupported"` \| `"pre-scheduler-store"`;
+  \}\>
 
 #### Constructors
 
@@ -29,10 +30,10 @@ new PostError(message, reason?): PostError;
 
 ###### Parameters
 
-| Parameter | Type                                |
-| --------- | ----------------------------------- |
-| `message` | `string`                            |
-| `reason?` | `"relational-deadline-unsupported"` |
+| Parameter | Type                                                           |
+| --------- | -------------------------------------------------------------- |
+| `message` | `string`                                                       |
+| `reason?` | `"relational-deadline-unsupported"` \| `"pre-scheduler-store"` |
 
 ###### Returns
 
@@ -43,7 +44,7 @@ new PostError(message, reason?): PostError;
 ```ts
 Data.TaggedError("PostError")<{
   readonly message: string;
-  readonly reason?: "relational-deadline-unsupported";
+  readonly reason?: "relational-deadline-unsupported" | "pre-scheduler-store";
 }>.constructor
 ```
 
@@ -52,7 +53,7 @@ Data.TaggedError("PostError")<{
 ##### reason?
 
 ```ts
-readonly optional reason?: "relational-deadline-unsupported";
+readonly optional reason?: "relational-deadline-unsupported" | "pre-scheduler-store";
 ```
 
 ###### Inherited from
@@ -93,58 +94,6 @@ type PostDeliveryResult =
 ```
 
 Receiver's idempotent admission decision.
-
----
-
-### PostOutboxStore
-
-```ts
-type PostOutboxStore<E> = Readonly<{
-  put: (key, value) => Effect.Effect<void, E>;
-  read: (key) => Effect.Effect<string | undefined, E>;
-  list: (
-    limit,
-    afterKey?,
-  ) => Effect.Effect<
-    readonly Readonly<{
-      key: string;
-      value: string;
-    }>[],
-    E
-  >;
-  delete: (key) => Effect.Effect<void, E>;
-}>;
-```
-
-Durable, string-backed rows. A delivered receipt must outlive source replay.
-
-#### Type Parameters
-
-| Type Parameter |
-| -------------- |
-| `E`            |
-
----
-
-### PostOutbox
-
-```ts
-type PostOutbox<M, E> = Readonly<{
-  enqueue: (message, at?) => Effect.Effect<number | undefined, E>;
-  drain: () => Effect.Effect<void, E>;
-  nextWakeAt: () => Effect.Effect<number | undefined, E>;
-  deadLetters: (limit, afterKey?) => Effect.Effect<M[], E>;
-}>;
-```
-
-Bounded generic delivery owned by Post.
-
-#### Type Parameters
-
-| Type Parameter |
-| -------------- |
-| `M`            |
-| `E`            |
 
 ---
 
@@ -243,12 +192,8 @@ Runtime operations that preserve the route's schema evidence.
 ```ts
 type PostRuntime<R> = Readonly<{
   send: <K>(input) => void;
-  execute: (job) => Promise<
-    Readonly<{
-      kind: "completed";
-    }>
-  >;
-  enqueueDue: (limit?, afterKey?) => Promise<string | undefined>;
+  retryPolicy: (job) => Promise<WatchdogRetryPolicy>;
+  execute: (job, attempt, signal?) => Promise<WatchdogExecutionDecision>;
   releaseNow: (limit?, afterKey?) => Promise<string | undefined>;
   deadLetters: (
     limit?,
@@ -273,7 +218,6 @@ type PostRuntime<R> = Readonly<{
     | undefined;
   retry: (key) => Promise<void>;
   read: (key) => PostRow | undefined;
-  nextWake: () => number | null;
 }>;
 ```
 
@@ -338,10 +282,8 @@ const PostRowSchema: fromJsonString<
           address: Unknown;
           event: Unknown;
         }>;
-        attempts: Int;
-        nextAttemptAt: Number;
         deadlineAt: optional<Number>;
-        jobId: optional<String>;
+        jobId: String;
         delivery: optional<
           Struct<{
             key: String;
@@ -350,12 +292,10 @@ const PostRowSchema: fromJsonString<
             event: Unknown;
           }>
         >;
-        nextKey: optional<String>;
       }>,
       Struct<{
         state: Literal<"delivered">;
         receipt: optional<Codec<Json, Json, never, never>>;
-        nextKey: optional<String>;
       }>,
       Struct<{
         state: Literal<"dead">;
@@ -377,7 +317,6 @@ const PostRowSchema: fromJsonString<
             event: Unknown;
           }>
         >;
-        nextKey: optional<String>;
       }>,
     ]
   >
@@ -387,62 +326,6 @@ const PostRowSchema: fromJsonString<
 Persisted Post row parser.
 
 ## Functions
-
-### makePostOutbox()
-
-```ts
-function makePostOutbox<M, E>(options): PostOutbox<M, E>;
-```
-
-The same bounded delivery and receipt machinery serves Post and BirdDog.
-
-#### Type Parameters
-
-| Type Parameter |
-| -------------- |
-| `M`            |
-| `E`            |
-
-#### Parameters
-
-| Parameter | Type                                                                                                                                                                                                                                                                                                                                              |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `options` | `Readonly`\<\{ `message`: `Schema.Codec`\<`M`\>; `key`: (`message`) => `string`; `outbox`: [`PostOutboxStore`](#postoutboxstore)\<`E`\>; `deliver`: (`message`) => `Effect.Effect`\<`boolean`, `E`\>; `scheduleWake`: (`at`) => `Effect.Effect`\<`void`, `E`\>; `now`: () => `number`; `invalidRow`: () => `E`; `encodingFailed`: () => `E`; \}\> |
-
-#### Returns
-
-[`PostOutbox`](#postoutbox)\<`M`, `E`\>
-
----
-
-### postOutboxPending()
-
-```ts
-function postOutboxPending<M, E>(options): Effect<boolean, E>;
-```
-
-Whether any message in an outbox still awaits a delivery attempt. Delivered
-receipts and exhausted dead letters are retained but owe nothing more, so a host
-may let their owner rest.
-
-#### Type Parameters
-
-| Type Parameter |
-| -------------- |
-| `M`            |
-| `E`            |
-
-#### Parameters
-
-| Parameter | Type                                                                                                                              |
-| --------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `options` | `Readonly`\<\{ `message`: `Schema.Codec`\<`M`\>; `outbox`: `Pick`\<[`PostOutboxStore`](#postoutboxstore)\<`E`\>, `"list"`\>; \}\> |
-
-#### Returns
-
-`Effect`\<`boolean`, `E`\>
-
----
 
 ### definePostRoute()
 
@@ -584,9 +467,9 @@ Decode at both persisted and DO boundaries with the route's Effect Schema.
 
 #### Parameters
 
-| Parameter | Type                                                                                                                                                                                                                                   |
-| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `options` | `Readonly`\<\{ `routes`: `R`; `owner`: `WatchdogSqliteOwner`; `transactional`: `WatchdogTransactionalProjection`; `readJob`: `WatchdogRuntime`\[`"read"`\]; `now`: () => `number`; `scheduleWake`: (`at`) => `Promise`\<`void`\>; \}\> |
+| Parameter | Type                                                                                                                                                                                         |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `options` | `Readonly`\<\{ `routes`: `R`; `owner`: `WatchdogSqliteOwner`; `transactional`: `WatchdogTransactionalProjection`; `now`: () => `number`; `scheduleWake`: (`at`) => `Promise`\<`void`\>; \}\> |
 
 #### Returns
 

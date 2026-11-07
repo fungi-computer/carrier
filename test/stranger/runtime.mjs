@@ -5,8 +5,6 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 
 import { createCarrier } from "@fungi.computer/carrier";
-import * as productionCarrier from "@fungi.computer/carrier";
-import { createMemoryOutbox } from "@fungi.computer/carrier/testing";
 import { createCloudflareCarrier } from "@fungi.computer/carrier/cloudflare";
 import { createCarrier as createEmailCarrier } from "@fungi.computer/carrier/email";
 import { createPost } from "@fungi.computer/carrier/post";
@@ -151,12 +149,3 @@ try {
 }
 
 export const nativeConstructors = { createD1Post, createPostgresPost };
-
-assert.equal(Object.hasOwn(productionCarrier, "createMemoryOutbox"), false);
-const memoryOutbox = createMemoryOutbox();
-await memoryOutbox.put("packed:one", "receipt");
-assert.deepEqual(await memoryOutbox.list(1), [
-  { key: "packed:one", value: "receipt" },
-]);
-await memoryOutbox.delete("packed:one");
-assert.equal(await memoryOutbox.read("packed:one"), undefined);

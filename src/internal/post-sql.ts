@@ -1,7 +1,11 @@
 import * as Schema from "effect/Schema";
-import { backoffDelay } from "@fungi.computer/almanac";
 import { defineIdFamily } from "@fungi.computer/cairn";
-import type { WatchdogRunningJob } from "@fungi.computer/watchdog";
+import type {
+  WatchdogRunningJob,
+  WatchdogAttempt,
+  WatchdogExecutionDecision,
+  WatchdogRetryPolicy,
+} from "@fungi.computer/watchdog";
 import {
   PostEnvelopeSchema,
   PostError,
@@ -14,18 +18,13 @@ import {
   postDisposition,
   deliveryReceipt,
 } from "./post-execution.js";
-import { maxDeliveryAttempts, postRetryPolicy } from "../post-outbox.js";
+import { maxDeliveryAttempts, postRetryPolicy } from "./post-policy.js";
 
 export type Value = string | number | null;
 export type Statement = Readonly<{ text: string; values: readonly Value[] }>;
 export type Row = Record<string, Value>;
 export type PostSql = Readonly<{
   query: (statement: Statement) => Promise<readonly Row[]>;
-  commit: (
-    statements: readonly Statement[],
-    key: string,
-    jobId: string,
-  ) => Promise<void>;
 }>;
 const ids = defineIdFamily({
   family: "post",
@@ -40,22 +39,13 @@ const Stored = Schema.Struct({
   queue_name: Schema.String,
   state: Schema.Literals(["pending", "delivered", "dead"]),
   attempts: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  next_attempt_at: Schema.Number,
   job_id: Schema.String,
   delivery_json: Schema.NullOr(Schema.String),
   receipt_json: Schema.NullOr(ReceiptJson),
   reason: Schema.NullOr(Schema.Literals(["refused", "exhausted"])),
 });
 const columns =
-  "post_key,envelope_json,queue_name,state,attempts,next_attempt_at,job_id,delivery_json,reason,receipt_json";
-const JobReference = Schema.Struct({
-  source_job: Schema.NullOr(Schema.String),
-});
-const pageSize = Schema.Int.check(
-  Schema.isGreaterThanOrEqualTo(1),
-  Schema.isLessThanOrEqualTo(64),
-);
-
+  "post_key,envelope_json,queue_name,state,attempts,job_id,delivery_json,reason,receipt_json";
 /** SQL native Carrier runtime configuration; route decisions remain in Post. */
 export type SqlPostOptions<R extends Record<string, PostRegistryRoute>> =
   Readonly<{
@@ -71,21 +61,17 @@ export type SqlPostOptions<R extends Record<string, PostRegistryRoute>> =
     }>;
     /** Clock shared with the database's Watchdog. */
     now: () => number;
-    /** Arm a durable wake after committed progress. */
-    scheduleWake: (at: number) => Promise<void>;
   }>;
 /** Async inspection and Watchdog executor shared by D1 and PostgreSQL. */
 export type SqlPostRuntime = Readonly<{
-  /** Execute an already claimed Post job through the registered receiver. */
+  /** Resolve the delivery budget before Watchdog reserves an attempt. */
+  retryPolicy: (job: WatchdogRunningJob) => Promise<WatchdogRetryPolicy>;
+  /** Execute an already claimed Post job with its reserved delivery attempt. */
   execute: (
     job: WatchdogRunningJob,
+    attempt: WatchdogAttempt | undefined,
     signal?: AbortSignal,
-  ) => Promise<Readonly<{ kind: "completed" }>>;
-  /** Recover a bounded page of settled attempts into new Watchdog jobs. */
-  enqueueDue: (
-    limit?: number,
-    afterKey?: string,
-  ) => Promise<string | undefined>;
+  ) => Promise<WatchdogExecutionDecision>;
   /** Read one producer receipt or pending envelope. */
   read: (key: string) => Promise<PostRow | undefined>;
 }>;
@@ -98,7 +84,6 @@ export function postSchema(postgres: boolean): readonly string[] {
       envelope_json TEXT NOT NULL,queue_name TEXT NOT NULL,
       state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','delivered','dead')),
       attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts>=0),
-      next_attempt_at ${postgres ? "DOUBLE PRECISION" : "INTEGER"} NOT NULL,
       job_id TEXT NOT NULL,delivery_json TEXT,
       reason TEXT CHECK(reason IN ('refused','exhausted')),
       receipt_json TEXT,
@@ -106,15 +91,14 @@ export function postSchema(postgres: boolean): readonly string[] {
       last_error TEXT CHECK(last_error IS NULL OR length(last_error)<=2048),
       attempt_until ${postgres ? "DOUBLE PRECISION" : "INTEGER"}
     )`,
-    "CREATE INDEX IF NOT EXISTS idx_post_due ON carrier_post_rows(state,next_attempt_at,post_key)",
     "CREATE INDEX IF NOT EXISTS idx_post_address ON carrier_post_rows(queue_name,state,sequence)",
   ];
 }
 
 export function admitPostSelect(source: Statement): Statement {
   return {
-    text: `INSERT INTO carrier_post_rows(post_key,envelope_json,queue_name,next_attempt_at,job_id)
-    SELECT post_key,envelope_json,queue_name,next_attempt_at,job_id FROM (${source.text}) AS admission WHERE true
+    text: `INSERT INTO carrier_post_rows(post_key,envelope_json,queue_name,job_id)
+    SELECT post_key,envelope_json,queue_name,job_id FROM (${source.text}) AS admission WHERE true
     ON CONFLICT(post_key) DO UPDATE SET post_key=NULL
     WHERE carrier_post_rows.envelope_json<>excluded.envelope_json OR carrier_post_rows.queue_name<>excluded.queue_name`,
     values: source.values,
@@ -132,7 +116,7 @@ export function jobSelect(
     : "json_object('postKey',post_key)";
   return {
     text: `SELECT job_id,queue_name,'post' AS lane,0 AS priority,${payload} AS payload_json,
-      CAST(NULL AS INTEGER) AS recovery_max FROM carrier_post_rows
+      CAST(NULL AS INTEGER) AS recovery_max,CAST(NULL AS INTEGER) AS recovery_window_ms,CAST(0 AS INTEGER) AS not_before FROM carrier_post_rows
       WHERE post_key=${bind}1 AND state='pending' ${expectedJobId === undefined ? "" : `AND job_id=${bind}2`}`,
     values: expectedJobId === undefined ? [key] : [key, expectedJobId],
   };
@@ -152,12 +136,11 @@ export function preparePost<R extends Record<string, PostRegistryRoute>>(
     key: envelope.key,
     statement: admitPostSelect({
       text: `SELECT CAST($1 AS TEXT) AS post_key,CAST($2 AS TEXT) AS envelope_json,
-      CAST($3 AS TEXT) AS queue_name,CAST($4 AS DOUBLE PRECISION) AS next_attempt_at,CAST($5 AS TEXT) AS job_id`,
+      CAST($3 AS TEXT) AS queue_name,CAST($4 AS TEXT) AS job_id`,
       values: [
         envelope.key,
         Schema.encodeSync(EnvelopeJson)(envelope),
         queue,
-        options.now(),
         jobId,
       ],
     }),
@@ -195,8 +178,6 @@ function publicRow(stored: ReturnType<typeof parseStored>): PostRow {
   return {
     state: "pending",
     envelope: stored.envelope,
-    attempts: stored.attempts,
-    nextAttemptAt: stored.next_attempt_at,
     jobId: stored.job_id,
     delivery: stored.delivery,
   };
@@ -226,19 +207,10 @@ export function openSqlPost<R extends Record<string, PostRegistryRoute>>(
   )(
     options.retry ?? {
       maxAttempts: maxDeliveryAttempts,
-      baseDelayMs: backoffDelay(1, postRetryPolicy),
-      maxDelayMs: backoffDelay(maxDeliveryAttempts, postRetryPolicy),
+      baseDelayMs: postRetryPolicy.baseMs,
+      maxDelayMs: postRetryPolicy.maxMs,
     },
   );
-  const delay = (attempt: number) =>
-    backoffDelay(attempt, {
-      baseMs: policy.baseDelayMs,
-      maxMs: policy.maxDelayMs,
-    });
-  const retrySql = Array.from(
-    { length: policy.maxAttempts },
-    (_, index) => `WHEN ${String(index)} THEN ${String(delay(index + 1))}`,
-  ).join(" ");
   for (const route of Object.values(options.routes)) {
     // Synchronous owner hooks cannot participate in an asynchronous transaction.
     if (
@@ -253,59 +225,87 @@ export function openSqlPost<R extends Record<string, PostRegistryRoute>>(
 
   const query = (text: string, values: readonly Value[] = []) =>
     database.query({ text, values });
+  const readStored = async (key: string) => {
+    const raw = (
+      await query(
+        `SELECT ${columns} FROM carrier_post_rows WHERE post_key=$1`,
+        [key],
+      )
+    )[0];
+    return raw === undefined ? undefined : parseStored(raw);
+  };
+  const postKeyOf = (job: WatchdogRunningJob) =>
+    Schema.decodeUnknownSync(Schema.Struct({ postKey: Schema.String }))(
+      job.payload,
+    ).postKey;
+  // Watchdog owns the attempt generation and lease. The retained ten-second
+  // receiver fence rejects delayed writes from a timed-out preparation/call.
+  const claimed = `post_key=$1 AND job_id=$2 AND state='pending' AND EXISTS (
+    SELECT 1 FROM watchdog_jobs w WHERE w.job_id=carrier_post_rows.job_id
+    AND w.state='running' AND w.attempt_count=$3 AND w.lease_until>$4)`;
   return {
     read: async (key) => {
-      const raw = (
-        await query(
-          `SELECT ${columns} FROM carrier_post_rows WHERE post_key=$1`,
-          [key],
-        )
-      )[0];
-      return raw === undefined ? undefined : publicRow(parseStored(raw));
+      const stored = await readStored(key);
+      return stored === undefined ? undefined : publicRow(stored);
     },
-    execute: async (job, signal) => {
-      const { postKey } = Schema.decodeUnknownSync(
-        Schema.Struct({ postKey: Schema.String }),
-      )(job.payload);
+    retryPolicy: async (job) => {
+      const row = await readStored(postKeyOf(job));
+      if (row === undefined) throw new PostError("delivery row is missing");
+      return {
+        baseMs: policy.baseDelayMs,
+        maxMs: policy.maxDelayMs,
+        limit: {
+          maxAttempts:
+            row.state === "pending" && row.job_id === job.jobId
+              ? policy.maxAttempts
+              : 0,
+        },
+      };
+    },
+    execute: async (job, reservation, signal) => {
+      if (reservation === undefined)
+        throw new PostError("delivery attempt is missing");
+      const postKey = postKeyOf(job);
+      const current = await readStored(postKey);
+      if (current === undefined) throw new PostError("delivery row is missing");
+      if (current.state !== "pending" || current.job_id !== job.jobId)
+        return { kind: "completed" };
+      const bindings = () => [
+        postKey,
+        job.jobId,
+        reservation.count,
+        options.now(),
+      ];
+      if (reservation.status === "exhausted") {
+        const settled = await query(
+          `UPDATE carrier_post_rows SET state='dead',reason='exhausted',attempts=$3,attempt_until=NULL,settled_at=$4 WHERE ${claimed} RETURNING post_key`,
+          bindings(),
+        );
+        if (settled.length !== 1)
+          throw new PostError("receipt was not committed");
+        return { kind: "completed" };
+      }
       const raw = (
         await query(
-          `UPDATE carrier_post_rows SET attempts=attempts+1,
-        next_attempt_at=CAST($1 AS DOUBLE PRECISION)+CASE attempts ${retrySql} ELSE ${String(delay(policy.maxAttempts))} END,attempt_until=$2 WHERE post_key=$3 AND job_id=$4 AND state='pending'
-        AND attempts<$5 AND NOT EXISTS (SELECT 1 FROM carrier_post_rows AS earlier
-          WHERE earlier.queue_name=carrier_post_rows.queue_name AND earlier.state='pending'
-          AND earlier.sequence<carrier_post_rows.sequence) RETURNING ${columns}`,
-          [
-            options.now(),
-            options.now() + 10_000,
-            postKey,
-            job.jobId,
-            policy.maxAttempts,
-          ],
+          `UPDATE carrier_post_rows SET attempt_until=$5 WHERE ${claimed} RETURNING ${columns}`,
+          [...bindings(), options.now() + 10_000],
         )
       )[0];
-      if (raw === undefined) return { kind: "completed" };
-      const stored = parseStored(raw);
-      const attempt = publicRow(stored);
+      if (raw === undefined)
+        throw new PostError("attempt claim is unavailable");
+      const attempt = publicRow(parseStored(raw));
       if (attempt.state !== "pending")
         throw new PostError("attempt is not pending");
       const route = options.routes[attempt.envelope.kind];
       if (route === undefined) throw new PostError("unknown address kind");
-      await options.scheduleWake(attempt.nextAttemptAt);
       const evidence = await deliverPost({
         signal,
         attempt,
         route,
         savePrepared: async (envelope) => {
           const saved = await query(
-            `UPDATE carrier_post_rows SET delivery_json=$1
-          WHERE post_key=$2 AND job_id=$3 AND attempts=$4 AND state='pending' AND attempt_until>$5 RETURNING post_key`,
-            [
-              Schema.encodeSync(EnvelopeJson)(envelope),
-              postKey,
-              job.jobId,
-              attempt.attempts,
-              options.now(),
-            ],
+            `UPDATE carrier_post_rows SET delivery_json=$5 WHERE ${claimed} AND attempt_until>$4 RETURNING post_key`,
+            [...bindings(), Schema.encodeSync(EnvelopeJson)(envelope)],
           );
           if (saved.length === 0) throw new PostError("preparation superseded");
         },
@@ -313,23 +313,18 @@ export function openSqlPost<R extends Record<string, PostRegistryRoute>>(
       const disposition = postDisposition(
         evidence,
         route,
-        attempt.attempts,
+        reservation.count,
         policy.maxAttempts,
       );
-      if (disposition.state === "keep") return { kind: "completed" };
-      const next = options.now() + delay(attempt.attempts);
+      if (disposition.state === "keep") return { kind: "retry" };
       const receipt = deliveryReceipt(evidence);
-      await query(
-        `UPDATE carrier_post_rows SET state=$1,reason=$2,next_attempt_at=$3,attempt_until=NULL,last_error=$8,receipt_json=$9,settled_at=CASE WHEN $1='pending' THEN NULL ELSE CAST($10 AS DOUBLE PRECISION) END
-        WHERE post_key=$4 AND job_id=$5 AND attempts=$6 AND state='pending' AND attempt_until>$7`,
+      const settled = await query(
+        `UPDATE carrier_post_rows SET state=$5,reason=$6,attempts=CASE WHEN $5='pending' THEN 0 ELSE $3 END,attempt_until=NULL,last_error=$7,receipt_json=$8,settled_at=CASE WHEN $5='pending' THEN NULL ELSE CAST($4 AS DOUBLE PRECISION) END
+        WHERE ${claimed} AND attempt_until>$4 RETURNING post_key`,
         [
+          ...bindings(),
           disposition.state,
           disposition.state === "dead" ? disposition.reason : null,
-          next,
-          postKey,
-          job.jobId,
-          attempt.attempts,
-          options.now(),
           evidence.result === "unavailable" &&
           options.failureDetail !== undefined
             ? options.failureDetail(evidence.failure).slice(0, 2048)
@@ -337,54 +332,11 @@ export function openSqlPost<R extends Record<string, PostRegistryRoute>>(
           receipt === undefined
             ? null
             : Schema.encodeSync(ReceiptJson)(receipt),
-          options.now(),
         ],
       );
-      await options.scheduleWake(
-        disposition.state === "pending" ? next : options.now(),
-      );
-      return { kind: "completed" };
-    },
-    enqueueDue: async (limit = 64, afterKey = "") => {
-      Schema.decodeUnknownSync(pageSize)(limit);
-      const rows = await query(
-        `SELECT ${columns
-          .split(",")
-          .map((column) => `p.${column}`)
-          .join(",")},w.job_id AS source_job
-        FROM carrier_post_rows p LEFT JOIN watchdog_jobs w ON p.job_id=w.job_id
-        WHERE p.state='pending' AND (w.job_id IS NULL OR (w.state='settled' AND p.next_attempt_at<=$1)) AND p.post_key>$2
-        ORDER BY p.post_key LIMIT $3`,
-        [options.now(), afterKey, limit],
-      );
-      let cursor: string | undefined;
-      for (const raw of rows) {
-        if (Schema.decodeUnknownSync(JobReference)(raw).source_job === null)
-          throw new PostError("delivery job is missing");
-        const row = parseStored(raw);
-        cursor = row.post_key;
-        const nextJobId = ids.work.generate();
-        await database.commit(
-          [
-            {
-              text: `UPDATE carrier_post_rows SET job_id=$1,state=CASE WHEN attempts>=$2 THEN 'dead' ELSE 'pending' END,
-            reason=CASE WHEN attempts>=$2 THEN 'exhausted' ELSE NULL END,
-            settled_at=CASE WHEN attempts>=$2 THEN CAST($5 AS DOUBLE PRECISION) ELSE NULL END
-            WHERE post_key=$3 AND job_id=$4 AND state='pending' AND next_attempt_at<=$5`,
-              values: [
-                nextJobId,
-                policy.maxAttempts,
-                row.post_key,
-                row.job_id,
-                options.now(),
-              ],
-            },
-          ],
-          row.post_key,
-          nextJobId,
-        );
-      }
-      return rows.length === limit ? cursor : undefined;
+      if (settled.length !== 1)
+        throw new PostError("receipt was not committed");
+      return { kind: disposition.state === "pending" ? "retry" : "completed" };
     },
   };
 }
