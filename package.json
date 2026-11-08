@@ -1,6 +1,6 @@
 {
   "name": "@fungi.computer/carrier",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "author": "Levi <levi@technomancy.dev>",
   "description": "Durable email submission and recipient delivery tracking",
   "type": "module",

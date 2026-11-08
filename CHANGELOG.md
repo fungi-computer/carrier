@@ -1,5 +1,12 @@
 # @fungi.computer/carrier
 
+## 0.2.4
+
+### Patch Changes
+
+- Updated dependencies
+  - @fungi.computer/watchdog@0.1.3
+
 ## 0.2.3
 
 ### Patch Changes
