@@ -1,49 +1,24 @@
 # Carrier (`@fungi.computer/carrier`)
 
-Carrier delivers things durably and tells you the truth about what happened. It
-has two parts.
+Carrier sends email and passes messages between parts of your app reliably, and
+records honestly what happened to each one.
 
-**Email.** You call `send()` with an email and a stable ID. Carrier commits it
-to SQLite, dispatches it through your provider, retries temporary refusals, and
-records what the provider actually said. A receipt never claims more than the
-evidence shows. If a response is lost, the email is `outcome_unknown`, and
-Carrier does not guess and send it twice.
+```mermaid
+flowchart LR
+  App[Your app] -->|send| Carrier
+  Carrier -->|commits to SQLite| Store[(Your storage)]
+  Carrier -->|tick| Provider[Email provider]
+  Carrier -->|Post| DO[Another Durable Object]
+  Provider -->|what it really said| Carrier
+```
 
-**Post.** Typed, ordered, point-to-point envelopes between named Cloudflare
-Durable Objects. You call `send` inside the same transaction as your own state
-change, and Post delivers the event to the addressed object with retries, dead
-letters and idempotent receipts.
+## Quick start
 
-Both run on [Watchdog](../watchdog/README.md) for durable work. The Cloudflare
-adapter wires Email to Durable Object SQLite, alarms and the Email Service
-binding, so your application keeps no delivery state machine of its own.
-
-## Install or set up
+Install it:
 
 ```sh
 npm install @fungi.computer/carrier @fungi.computer/watchdog
 ```
-
-The Node SQLite quick start imports Watchdog’s adapter directly.
-
-Carrier is ESM-only. It depends on `@fungi.computer/watchdog`, `effect`, `pg`
-and `@cloudflare/workers-types`, which npm installs for you. The portable Email
-owner and SQLite Post run on any synchronous SQLite handle, such as Durable
-Object storage or `node:sqlite` in Node 24. The D1 and PostgreSQL Post adapters
-need a migrated database.
-
-Entrypoints:
-
-- `@fungi.computer/carrier` and `@fungi.computer/carrier/email`: the Email API,
-  `createCarrier` and its types.
-- `@fungi.computer/carrier/cloudflare`: `createCloudflareCarrier` for a Durable
-  Object, and `cloudflareEmailTransport`.
-- `@fungi.computer/carrier/inspection`: read-only operator inspection.
-- `@fungi.computer/carrier/post`: Post over Durable Object SQLite.
-- `@fungi.computer/carrier/post-d1` and `@fungi.computer/carrier/post-postgres`:
-  Post over shared D1 or PostgreSQL.
-
-## Quick start
 
 This sends one email through an in-memory `node:sqlite` store and a fake
 transport. Swap the transport for a real provider and the store for your Durable
@@ -91,6 +66,72 @@ real host runs from its durable wake. The Cloudflare adapter does this for you
 from the Durable Object alarm.
 
 In a Durable Object, `ctx.storage` is already the SQLite owner.
+
+## Common tasks
+
+### Send an email
+
+`send()` stores it and `tick()` hands it to the provider. See the Quick start.
+
+### Send an event between objects
+
+Post sends inside your own transaction. See [Post](#post).
+
+### Inspect what happened
+
+See Operator inspection.
+
+### Use another provider or database
+
+See Another provider and
+[Post transactions on D1 and PostgreSQL](#post-transactions-on-d1-and-postgresql).
+
+## Reference
+
+### Overview
+
+Carrier delivers things durably and tells you the truth about what happened. It
+has two parts.
+
+**Email.** You call `send()` with an email and a stable ID. Carrier commits it
+to SQLite, dispatches it through your provider, retries temporary refusals, and
+records what the provider actually said. A receipt never claims more than the
+evidence shows. If a response is lost, the email is `outcome_unknown`, and
+Carrier does not guess and send it twice.
+
+**Post.** Typed, ordered, point-to-point envelopes between named Cloudflare
+Durable Objects. You call `send` inside the same transaction as your own state
+change, and Post delivers the event to the addressed object with retries, dead
+letters and idempotent receipts.
+
+Both run on [Watchdog](../watchdog/README.md) for durable work. The Cloudflare
+adapter wires Email to Durable Object SQLite, alarms and the Email Service
+binding, so your application keeps no delivery state machine of its own.
+
+## Install or set up
+
+```sh
+npm install @fungi.computer/carrier @fungi.computer/watchdog
+```
+
+The Node SQLite quick start imports Watchdog’s adapter directly.
+
+Carrier is ESM-only. It depends on `@fungi.computer/watchdog`, `effect`, `pg`
+and `@cloudflare/workers-types`, which npm installs for you. The portable Email
+owner and SQLite Post run on any synchronous SQLite handle, such as Durable
+Object storage or `node:sqlite` in Node 24. The D1 and PostgreSQL Post adapters
+need a migrated database.
+
+Entrypoints:
+
+- `@fungi.computer/carrier` and `@fungi.computer/carrier/email`: the Email API,
+  `createCarrier` and its types.
+- `@fungi.computer/carrier/cloudflare`: `createCloudflareCarrier` for a Durable
+  Object, and `cloudflareEmailTransport`.
+- `@fungi.computer/carrier/inspection`: read-only operator inspection.
+- `@fungi.computer/carrier/post`: Post over Durable Object SQLite.
+- `@fungi.computer/carrier/post-d1` and `@fungi.computer/carrier/post-postgres`:
+  Post over shared D1 or PostgreSQL.
 
 ## Core concepts
 
