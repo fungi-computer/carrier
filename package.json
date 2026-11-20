@@ -1,6 +1,6 @@
 {
   "name": "@fungi.computer/carrier",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "author": "Levi <levi@technomancy.dev>",
   "description": "Durable email submission and recipient delivery tracking",
   "type": "module",
@@ -52,7 +52,7 @@
     "@cloudflare/workers-types": "5.20260828.1",
     "@fungi.computer/almanac": "0.2.1",
     "@fungi.computer/cairn": "0.1.0",
-    "@fungi.computer/watchdog": "0.1.4",
+    "@fungi.computer/watchdog": "0.1.5",
     "effect": "4.0.2",
     "pg": "8.23.0",
     "@types/pg": "8.23.1"
