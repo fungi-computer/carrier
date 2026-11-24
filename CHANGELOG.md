@@ -1,5 +1,18 @@
 # @fungi.computer/carrier
 
+## 0.2.8
+
+### Patch Changes
+
+- Changes since 0.2.7:
+
+  - fix(deps): update the Cloudflare Vitest plugin to the release that exits
+    cleanly
+
+- Updated dependencies
+  - @fungi.computer/cairn@0.1.1
+  - @fungi.computer/watchdog@0.1.7
+
 ## 0.2.7
 
 ### Patch Changes
